@@ -1,0 +1,195 @@
+name: Build and Deploy to {{ ENV_NAME | capitalize }}
+
+on:
+  push:
+    branches:
+      - {{ MAIN_BRANCH }}
+    paths-ignore:
+      - '.github/**'
+
+# Shared constants across all environments
+env:
+  AWS_REGION: {{ AWS_REGION }}
+  ECR_REPOSITORY: {{ ECR_REPOSITORY }}
+  CONTAINER_NAME: {{ CONTAINER_NAME }}
+{% if MIGRATIONS_ENABLED %}
+  MIGRATIONS_CONTAINER_NAME: {{ MIGRATIONS_CONTAINER_NAME }}
+{% endif %}
+
+jobs:
+  build_push_deploy_{{ ENV_SHORT_NAME }}:
+    name: Build, Push, and Deploy to {{ ENV_NAME | capitalize }}
+    runs-on: ubuntu-latest
+    environment: {{ GITHUB_ENVIRONMENT }}
+    concurrency: {{ ENV_SHORT_NAME }}-deploy
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          # Compute timestamp in UTC (YYYY.mm.dd-HHMM format)
+          TIMESTAMP=$(date -u +'%Y.%m.%d-%H%M')
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+          # Compute short and full SHA
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
+
+          # Compute immutable image tags
+          CI_TAG="ci-${TIMESTAMP}-${SHORT_SHA}"
+          SHA_TAG="sha-${FULL_SHA}"
+          echo "ci_tag=$CI_TAG" >> $GITHUB_OUTPUT
+          echo "sha_tag=$SHA_TAG" >> $GITHUB_OUTPUT
+
+          echo "## Image Tags" >> $GITHUB_STEP_SUMMARY
+          echo "- CI Tag: \`$CI_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- SHA Tag: \`$SHA_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`$FULL_SHA\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # SOURCE OF TRUTH: GitHub Environment Secret ({{ ENV_NAME }})
+          role-to-assume: ${{ '{{' }} secrets.AWS_ROLE_TO_ASSUME {{ '}}' }}
+          aws-region: ${{ '{{' }} env.AWS_REGION {{ '}}' }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}
+          CI_TAG: ${{ '{{' }} steps.tags.outputs.ci_tag {{ '}}' }}
+          SHA_TAG: ${{ '{{' }} steps.tags.outputs.sha_tag {{ '}}' }}
+{% if BUILD_ARGS %}
+{% for arg in BUILD_ARGS %}
+          {{ arg }}: ${{ '{{' }} secrets.{{ arg }} {{ '}}' }}
+{% endfor %}
+{% endif %}
+        run: |
+          echo "Building image for linux/amd64..."
+          docker buildx build \
+            --platform linux/amd64 \
+{% if BUILD_ARGS %}
+{% for arg in BUILD_ARGS %}
+            --build-arg {{ arg }}=${{ arg }} \
+{% endfor %}
+{% endif %}
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$CI_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG \
+            --load \
+            .
+
+          # Output the canonical deployment tag
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG" >> $GITHUB_OUTPUT
+
+      - name: Push image tags to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}
+          CI_TAG: ${{ '{{' }} steps.tags.outputs.ci_tag {{ '}}' }}
+          SHA_TAG: ${{ '{{' }} steps.tags.outputs.sha_tag {{ '}}' }}
+        run: |
+          echo "Pushing immutable tags to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$CI_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG
+
+          echo "## Pushed Images" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$ECR_REGISTRY/$ECR_REPOSITORY:$CI_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG\`" >> $GITHUB_STEP_SUMMARY
+{% if MIGRATIONS_ENABLED %}
+      - name: Read migrations image version
+        id: migrations
+        run: |
+          # SOURCE OF TRUTH: {{ VERSIONS_FILE }}
+          MIGRATIONS_IMAGE=$(grep '^migrations_image:' {{ VERSIONS_FILE }} | awk '{print $2}' | tr -d '"')
+
+          if [ -z "$MIGRATIONS_IMAGE" ]; then
+            echo "❌ Error: migrations_image not found in {{ VERSIONS_FILE }}"
+            exit 1
+          fi
+
+          echo "migrations_image=$MIGRATIONS_IMAGE" >> $GITHUB_OUTPUT
+          echo "Migrations image: $MIGRATIONS_IMAGE"
+{% endif %}
+      - name: Download ECS task definition
+        run: |
+          # SOURCE OF TRUTH: GitHub Environment Variable ({{ ENV_NAME }})
+          ECS_TASK_DEFINITION="${{ '{{' }} vars.ECS_TASK_DEFINITION {{ '}}' }}"
+
+          echo "Downloading task definition: $ECS_TASK_DEFINITION"
+          aws ecs describe-task-definition \
+            --task-definition $ECS_TASK_DEFINITION \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with API image
+        id: task-def{% if MIGRATIONS_ENABLED %}-api{% endif %}
+
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ '{{' }} env.CONTAINER_NAME {{ '}}' }}
+          image: ${{ '{{' }} steps.build-image.outputs.image {{ '}}' }}
+{% if MIGRATIONS_ENABLED %}
+      - name: Update task definition with migrations image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ '{{' }} steps.task-def-api.outputs.task-definition {{ '}}' }}
+          container-name: ${{ '{{' }} env.MIGRATIONS_CONTAINER_NAME {{ '}}' }}
+          image: ${{ '{{' }} steps.migrations.outputs.migrations_image {{ '}}' }}
+{% endif %}
+      - name: Deploy to {{ ENV_NAME | capitalize }} ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ '{{' }} steps.task-def{% if not MIGRATIONS_ENABLED %}-api{% endif %}.outputs.task-definition {{ '}}' }}
+          # SOURCE OF TRUTH: GitHub Environment Variable ({{ ENV_NAME }})
+          service: ${{ '{{' }} vars.ECS_SERVICE {{ '}}' }}
+          # SOURCE OF TRUTH: GitHub Environment Variable ({{ ENV_NAME }})
+          cluster: ${{ '{{' }} vars.ECS_CLUSTER {{ '}}' }}
+          wait-for-service-stability: true
+
+      - name: Deployment Summary
+        env:
+          ECR_REGISTRY: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}
+          CI_TAG: ${{ '{{' }} steps.tags.outputs.ci_tag {{ '}}' }}
+          SHA_TAG: ${{ '{{' }} steps.tags.outputs.sha_tag {{ '}}' }}
+          FULL_SHA: ${{ '{{' }} steps.tags.outputs.full_sha {{ '}}' }}
+{% if MIGRATIONS_ENABLED %}
+          MIGRATIONS_IMAGE: ${{ '{{' }} steps.migrations.outputs.migrations_image {{ '}}' }}
+{% endif %}
+        run: |
+          echo "## ✅ {{ ENV_NAME | capitalize }} Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: {{ ENV_NAME | capitalize }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA**: \`$FULL_SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Cluster**: \`${{ '{{' }} vars.ECS_CLUSTER {{ '}}' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Service**: \`${{ '{{' }} vars.ECS_SERVICE {{ '}}' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### API Image Tags Pushed" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$CI_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$SHA_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployed Images" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**API Container:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+{% if MIGRATIONS_ENABLED %}
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Migrations Init Container:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$MIGRATIONS_IMAGE" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY{% endif %}

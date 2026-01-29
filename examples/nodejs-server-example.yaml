@@ -1,0 +1,96 @@
+# Example Configuration: NodeJS Server
+# This example shows a complete configuration for a NodeJS API server
+# with database migrations, private npm packages, and two environments
+
+project:
+  name: myapi
+  type: nodejs-server
+  repository_path: /Users/yourname/projects/myapi
+
+  aws:
+    region: us-east-1
+    ecr_repository: myapi
+
+  github:
+    org: myorg
+    repo: myapi
+    main_branch: main
+
+environments:
+  development:
+    enabled: true
+
+    trigger:
+      type: push
+      branch: main
+      paths_ignore:
+        - '.github/**'
+
+    github_environment: development
+
+    deployment:
+      enabled: true
+      ecs_cluster: myapi-dev-cluster
+      ecs_service: myapi-dev-api
+      ecs_task_definition: myapi-dev-api
+      container_name: api
+
+    # Example with migrations enabled
+    migrations:
+      enabled: true
+      container_name: migration
+      versions_file: deploy/versions.yml
+
+    # Build args for private npm packages
+    build_args:
+      - NPM_TOKEN
+
+  production:
+    enabled: true
+
+    trigger:
+      type: tag
+      tag_pattern: 'v*'
+
+    github_environment: production
+
+    deployment:
+      enabled: true
+      ecs_cluster: myapi-prod-cluster
+      ecs_service: myapi-prod-api
+      ecs_task_definition: myapi-prod-api
+      container_name: api
+
+    migrations:
+      enabled: true
+      container_name: migration
+      versions_file: deploy/versions.yml
+
+    build_args:
+      - NPM_TOKEN
+
+    # Production validations
+    validations:
+      verify_version: true
+      verify_branch: true
+      verify_image_exists: true
+
+docker:
+  generate_dockerfile: true
+  generate_build_script: true
+  platform: linux/amd64
+
+  nodejs_server:
+    base_image: node:22-alpine
+    work_dir: /var/api
+    port: 3020
+    health_check_path: /health
+    has_blockchain: false
+
+release:
+  generate_script: true
+  require_clean_tree: true
+  require_main_branch: true
+  verify_package_version: true
+  prevent_downgrades: true
+  create_github_release: true

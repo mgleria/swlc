@@ -1,0 +1,364 @@
+#!/usr/bin/env node
+
+/**
+ * Release to Production Script
+ *
+ * Promotes the current package.json version to production by creating
+ * and pushing a git tag. This triggers the CI/CD production deployment.
+ *
+ * Usage: npm run release:prod [--yes] [--dry-run]
+ *
+ * Options:
+ *   --yes, -y      Skip confirmation prompt
+ *   --dry-run, -n  Validate without creating or pushing tag
+ */
+
+import { execSync } from 'child_process';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// ANSI color codes for terminal output
+const colors = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  cyan: '\x1b[36m',
+};
+
+const log = {
+  error: (msg) => console.error(`${colors.red}✗${colors.reset} ${msg}`),
+  success: (msg) => console.log(`${colors.green}✓${colors.reset} ${msg}`),
+  info: (msg) => console.log(`${colors.blue}ℹ${colors.reset} ${msg}`),
+  warn: (msg) => console.log(`${colors.yellow}⚠${colors.reset} ${msg}`),
+  step: (msg) => console.log(`${colors.cyan}▸${colors.reset} ${msg}`),
+  title: (msg) => console.log(`\n${colors.bright}${msg}${colors.reset}\n`),
+};
+
+/**
+ * Execute a git command and return stdout (trimmed)
+ */
+function git(command, options = {}) {
+  try {
+    return execSync(`git ${command}`, {
+      encoding: 'utf8',
+      stdio: options.silent ? 'pipe' : ['pipe', 'pipe', 'inherit'],
+      ...options,
+    }).trim();
+  } catch (error) {
+    if (options.throwOnError !== false) {
+      throw error;
+    }
+    return null;
+  }
+}
+
+/**
+ * Parse a semver version string into components
+ */
+function parseSemver(version) {
+  const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) return null;
+  return {
+    major: parseInt(match[1], 10),
+    minor: parseInt(match[2], 10),
+    patch: parseInt(match[3], 10),
+    original: version,
+  };
+}
+
+/**
+ * Compare two semver versions
+ * Returns: -1 if a < b, 0 if a == b, 1 if a > b
+ */
+function compareSemver(a, b) {
+  if (a.major !== b.major) return a.major < b.major ? -1 : 1;
+  if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
+  if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
+  return 0;
+}
+
+/**
+ * Get the highest semver tag from origin
+ */
+function getHighestSemverTag() {
+  // Get all tags matching v*
+  const tagsOutput = git('tag -l "v*"', { silent: true });
+  if (!tagsOutput) return null;
+
+  const tags = tagsOutput.split('\n').filter(Boolean);
+  const semverTags = tags
+    .map(parseSemver)
+    .filter(Boolean);
+
+  if (semverTags.length === 0) return null;
+
+  // Find the highest version
+  return semverTags.reduce((highest, current) => {
+    return compareSemver(current, highest) > 0 ? current : highest;
+  });
+}
+
+/**
+ * Main validation and release function
+ */
+async function releaseToProduction() {
+  log.title('🚀 Release to Production');
+
+  // ============================================================
+  // A) BRANCH & WORKSPACE STATE
+  // ============================================================
+
+  log.step('Checking git repository state...');
+
+  // 1. Verify current branch is {{ MAIN_BRANCH }}
+  const currentBranch = git('rev-parse --abbrev-ref HEAD', { silent: true });
+  if (currentBranch !== '{{ MAIN_BRANCH }}') {
+    log.error(`Must run from {{ MAIN_BRANCH }} branch (current: ${currentBranch})`);
+    process.exit(1);
+  }
+  log.success('On {{ MAIN_BRANCH }} branch');
+
+  // 2. Verify working tree is clean
+  const status = git('status --porcelain', { silent: true });
+  if (status) {
+    log.error('Working tree has uncommitted changes:');
+    console.log(status);
+    console.log('\nCommit or stash changes before releasing.');
+    process.exit(1);
+  }
+  log.success('Working tree clean');
+
+  // 3. Verify origin remote exists
+  const remotes = git('remote', { silent: true });
+  if (!remotes.includes('origin')) {
+    log.error('Git remote "origin" not found');
+    process.exit(1);
+  }
+  log.success('Origin remote exists');
+
+  // 4. Fetch origin/{{ MAIN_BRANCH }} and tags
+  log.step('Fetching latest from origin...');
+  try {
+    git('fetch origin {{ MAIN_BRANCH }} --tags', { silent: true });
+    log.success('Fetched origin/{{ MAIN_BRANCH }} and tags');
+  } catch (error) {
+    log.error('Failed to fetch from origin');
+    throw error;
+  }
+
+  // ============================================================
+  // B) SYNC SAFETY
+  // ============================================================
+
+  log.step('Verifying sync with origin/{{ MAIN_BRANCH }}...');
+
+  // 5. Require HEAD == origin/{{ MAIN_BRANCH }}
+  const headSha = git('rev-parse HEAD', { silent: true });
+  const originMainSha = git('rev-parse origin/{{ MAIN_BRANCH }}', { silent: true });
+
+  if (headSha !== originMainSha) {
+    // Determine the relationship
+    const mergeBase = git(`merge-base HEAD origin/{{ MAIN_BRANCH }}`, { silent: true });
+
+    if (mergeBase === headSha) {
+      log.error('Your {{ MAIN_BRANCH }} is behind origin/{{ MAIN_BRANCH }}. Pull latest changes:');
+      console.log('\n  git pull origin {{ MAIN_BRANCH }}\n');
+    } else if (mergeBase === originMainSha) {
+      log.error('Your {{ MAIN_BRANCH }} has commits not on origin/{{ MAIN_BRANCH }}. Push or reset:');
+      console.log('\n  git push origin {{ MAIN_BRANCH }}\n');
+    } else {
+      log.error('Your {{ MAIN_BRANCH }} diverged from origin/{{ MAIN_BRANCH }}. Fix before releasing:');
+      console.log('\n  git rebase origin/{{ MAIN_BRANCH }}\n  or\n  git reset --hard origin/{{ MAIN_BRANCH }}\n');
+    }
+    process.exit(1);
+  }
+  log.success('Local {{ MAIN_BRANCH }} is in sync with origin/{{ MAIN_BRANCH }}');
+
+  // ============================================================
+  // C) VERSION/TAG CORRECTNESS
+  // ============================================================
+
+  log.step('Validating version...');
+
+  // 6. Read version from package.json
+  const packageJsonPath = join(dirname(__dirname), 'package.json');
+  let packageJson;
+  try {
+    packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  } catch (error) {
+    log.error(`Failed to read package.json: ${error.message}`);
+    process.exit(1);
+  }
+
+  const version = packageJson.version;
+  if (!version) {
+    log.error('No version field found in package.json');
+    process.exit(1);
+  }
+
+  // Validate strict semver (X.Y.Z only)
+  const semverPattern = /^\d+\.\d+\.\d+$/;
+  if (!semverPattern.test(version)) {
+    log.error(`Version must be strict semver X.Y.Z (no prerelease/metadata): ${version}`);
+    process.exit(1);
+  }
+  log.success(`Version: ${version}`);
+
+  // 7. Derive tag
+  const tag = `v${version}`;
+  const newVersion = parseSemver(version);
+
+  // 8. Ensure tag doesn't already exist
+  log.step('Checking tag availability...');
+
+  // Check local
+  const localTagExists = git(`show-ref --tags --verify --quiet refs/tags/${tag}`, {
+    silent: true,
+    throwOnError: false,
+  });
+  if (localTagExists !== null) {
+    log.error(`Tag ${tag} already exists locally`);
+    console.log('Either the version was already released, or delete the local tag:');
+    console.log(`\n  git tag -d ${tag}\n`);
+    process.exit(1);
+  }
+
+  // Check remote
+  const remoteTagExists = git(`ls-remote --tags origin "refs/tags/${tag}"`, {
+    silent: true,
+  });
+  if (remoteTagExists) {
+    log.error(`Tag ${tag} already exists on origin`);
+    console.log('This version has already been released.');
+    console.log('Bump the version in package.json and try again.');
+    process.exit(1);
+  }
+  log.success(`Tag ${tag} is available`);
+
+  // 9. Prevent downgrades
+  log.step('Checking version ordering...');
+
+  const highestTag = getHighestSemverTag();
+  if (highestTag) {
+    const comparison = compareSemver(newVersion, highestTag);
+    if (comparison <= 0) {
+      log.error(
+        `Version ${version} must be greater than latest released ${highestTag.original}`
+      );
+      console.log('\nBump the version in package.json to a higher number.');
+      process.exit(1);
+    }
+    log.success(`Version ${version} > latest ${highestTag.original}`);
+  } else {
+    log.info('No previous semver tags found (first release)');
+  }
+
+  // ============================================================
+  // D) CONFIRMATION & TAG CREATION
+  // ============================================================
+
+  const skipConfirmation = process.argv.includes('--yes') || process.argv.includes('-y');
+  const dryRun = process.argv.includes('--dry-run') || process.argv.includes('-n');
+
+  if (dryRun) {
+    log.title('✅ Dry Run Complete - All Validations Passed');
+    console.log(`  Version:    ${colors.bright}${version}${colors.reset}`);
+    console.log(`  Tag:        ${colors.bright}${tag}${colors.reset}`);
+    console.log(`  Commit:     ${colors.bright}${headSha.substring(0, 8)}${colors.reset}`);
+    console.log('');
+    console.log('Would create and push:');
+    console.log(`  ${colors.cyan}git tag -a "${tag}" -m "Release ${tag}"${colors.reset}`);
+    console.log(`  ${colors.cyan}git push origin "${tag}"${colors.reset}`);
+    console.log('');
+    log.info('No changes made (dry run mode)');
+    log.info('Run without --dry-run to actually release');
+    process.exit(0);
+  }
+
+  if (!skipConfirmation) {
+    log.title('📋 Release Summary');
+    console.log(`  Version:    ${colors.bright}${version}${colors.reset}`);
+    console.log(`  Tag:        ${colors.bright}${tag}${colors.reset}`);
+    console.log(`  Commit:     ${colors.bright}${headSha.substring(0, 8)}${colors.reset}`);
+    console.log(`  Branch:     ${colors.bright}{{ MAIN_BRANCH }}${colors.reset}`);
+    console.log('');
+    console.log('This will:');
+    console.log(`  1. Create annotated tag ${colors.cyan}${tag}${colors.reset}`);
+    console.log(`  2. Push tag to ${colors.cyan}origin${colors.reset}`);
+    console.log(`  3. Trigger ${colors.cyan}production deployment workflow${colors.reset}`);
+    console.log('');
+
+    // Simple confirmation (no external deps)
+    const readline = await import('readline');
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    const answer = await new Promise((resolve) => {
+      rl.question('Proceed? [y/N] ', resolve);
+    });
+    rl.close();
+
+    if (!answer.toLowerCase().startsWith('y')) {
+      log.info('Release cancelled');
+      process.exit(0);
+    }
+  }
+
+  // 10. Create annotated tag
+  log.step('Creating annotated tag...');
+  try {
+    git(`tag -a "${tag}" -m "Release ${tag}"`, { silent: true });
+    log.success(`Created tag ${tag}`);
+  } catch (error) {
+    log.error(`Failed to create tag: ${error.message}`);
+    process.exit(1);
+  }
+
+  // 11. Push tag
+  log.step('Pushing tag to origin...');
+  try {
+    git(`push origin "${tag}"`, { silent: true });
+    log.success(`Pushed tag ${tag} to origin`);
+  } catch (error) {
+    log.error(`Failed to push tag: ${error.message}`);
+    console.log('\nTag was created locally but not pushed.');
+    console.log(`To retry, run: git push origin ${tag}`);
+    console.log(`To delete local tag: git tag -d ${tag}`);
+    process.exit(1);
+  }
+
+  // 12. Print summary
+  log.title('✅ Release Initiated');
+
+  console.log(`  ${colors.green}●${colors.reset} Tag ${colors.bright}${tag}${colors.reset} pushed successfully`);
+  console.log(`  ${colors.green}●${colors.reset} Commit: ${colors.bright}${headSha}${colors.reset}`);
+  console.log('');
+  console.log(`${colors.cyan}Next steps:${colors.reset}`);
+  console.log('  1. GitHub Actions will automatically deploy to production');
+  console.log('  2. Monitor workflow: https://github.com/{{ GITHUB_ORG }}/{{ GITHUB_REPO }}/actions');
+  console.log('  3. On success, a GitHub Release will be created');
+  console.log('');
+  log.warn('If CI fails artifact verification:');
+  console.log('     • Ensure commit was built (merged to {{ MAIN_BRANCH }} first)');
+  console.log('     • Fix the build pipeline if needed');
+  console.log('     • Bump version and retry with new tag');
+  console.log('');
+}
+
+// Run the script
+releaseToProduction().catch((error) => {
+  log.error(`Unexpected error: ${error.message}`);
+  if (error.stack) {
+    console.error(error.stack);
+  }
+  process.exit(1);
+});

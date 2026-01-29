@@ -1,0 +1,27 @@
+# Project configuration (may contain sensitive data)
+config/project.yaml
+
+# Generated files and outputs
+generated/
+outputs/
+
+# Backup files
+*.backup.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log

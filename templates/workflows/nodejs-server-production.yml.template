@@ -1,0 +1,345 @@
+name: Deploy to Production and Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Shared constants across all environments
+env:
+  AWS_REGION: {{ AWS_REGION }}
+  ECR_REPOSITORY: {{ ECR_REPOSITORY }}
+  CONTAINER_NAME: {{ CONTAINER_NAME }}
+{% if MIGRATIONS_ENABLED %}
+  MIGRATIONS_CONTAINER_NAME: {{ MIGRATIONS_CONTAINER_NAME }}
+{% endif %}
+
+jobs:
+  deploy_prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment: {{ GITHUB_ENVIRONMENT }}
+    concurrency: prod-deploy
+
+    permissions:
+      id-token: write
+      contents: write  # Needed for creating releases
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history to resolve tag ancestry
+
+      - name: Resolve tag and compute image tag
+        id: resolve
+        run: |
+          # Get the tag name
+          GIT_TAG="${{ '{{' }} github.ref_name {{ '}}' }}"
+          echo "git_tag=$GIT_TAG" >> $GITHUB_OUTPUT
+
+          # Resolve tag to commit SHA
+          FULL_SHA=$(git rev-parse $GIT_TAG^{commit})
+          echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
+
+          # Compute the image tag (same as used in development)
+          IMAGE_TAG="sha-${FULL_SHA}"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+          echo "## Tag Resolution" >> $GITHUB_STEP_SUMMARY
+          echo "- Tag: \`$GIT_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit SHA: \`$FULL_SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Image Tag: \`$IMAGE_TAG\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Verify tag matches package.json version
+        env:
+          GIT_TAG: ${{ '{{' }} steps.resolve.outputs.git_tag {{ '}}' }}
+        run: |
+          echo "Verifying tag matches package.json version..."
+
+          # Extract version from tag (remove 'v' prefix)
+          TAG_VERSION="${GIT_TAG#v}"
+
+          # Read version from package.json
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+
+          echo "Tag version: $TAG_VERSION"
+          echo "Package version: $PACKAGE_VERSION"
+
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "❌ Error: Tag version does not match package.json version"
+            echo ""
+            echo "Tag:         v$TAG_VERSION"
+            echo "package.json: $PACKAGE_VERSION"
+            echo ""
+            echo "This usually means the tag was created manually without updating package.json."
+            echo "Use 'npm run release:prod' to ensure consistency."
+            exit 1
+          fi
+
+          echo "✅ Tag version matches package.json"
+
+      - name: Verify tag is from main branch
+        env:
+          FULL_SHA: ${{ '{{' }} steps.resolve.outputs.full_sha {{ '}}' }}
+        run: |
+          echo "Verifying that commit $FULL_SHA is an ancestor of main..."
+
+          # Fetch main branch
+          git fetch origin {{ MAIN_BRANCH }}
+
+          # Check if the commit is an ancestor of main
+          if git merge-base --is-ancestor "$FULL_SHA" origin/{{ MAIN_BRANCH }}; then
+            echo "✅ Commit is on main branch"
+          else
+            echo "❌ Error: Tag commit is not an ancestor of main branch"
+            echo "Only tags from main branch can be deployed to production"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # SOURCE OF TRUTH: GitHub Environment Secret (production)
+          role-to-assume: ${{ '{{' }} secrets.AWS_ROLE_TO_ASSUME {{ '}}' }}
+          aws-region: ${{ '{{' }} env.AWS_REGION {{ '}}' }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+{% if MIGRATIONS_ENABLED %}
+      - name: Read migrations image version
+        id: migrations
+        run: |
+          # SOURCE OF TRUTH: {{ VERSIONS_FILE }}
+          MIGRATIONS_IMAGE=$(grep '^migrations_image:' {{ VERSIONS_FILE }} | awk '{print $2}' | tr -d '"')
+
+          if [ -z "$MIGRATIONS_IMAGE" ]; then
+            echo "❌ Error: migrations_image not found in {{ VERSIONS_FILE }}"
+            exit 1
+          fi
+
+          echo "migrations_image=$MIGRATIONS_IMAGE" >> $GITHUB_OUTPUT
+          echo "Migrations image: $MIGRATIONS_IMAGE"
+{% endif %}
+      - name: Verify API image exists in ECR
+        env:
+          ECR_REGISTRY: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}
+          IMAGE_TAG: ${{ '{{' }} steps.resolve.outputs.image_tag {{ '}}' }}
+        run: |
+          echo "Verifying API image exists: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          if aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --image-ids imageTag=$IMAGE_TAG \
+            --region $AWS_REGION > /dev/null 2>&1; then
+            echo "✅ API image found in ECR"
+
+            # Get image details
+            IMAGE_DIGEST=$(aws ecr describe-images \
+              --repository-name $ECR_REPOSITORY \
+              --image-ids imageTag=$IMAGE_TAG \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)
+
+            IMAGE_PUSHED=$(aws ecr describe-images \
+              --repository-name $ECR_REPOSITORY \
+              --image-ids imageTag=$IMAGE_TAG \
+              --query 'imageDetails[0].imagePushedAt' \
+              --output text)
+
+            echo "## API Image Verification" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Image exists in ECR" >> $GITHUB_STEP_SUMMARY
+            echo "- **Image**: \`$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Digest**: \`$IMAGE_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Pushed**: $IMAGE_PUSHED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ API Image Not Found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The image \`$IMAGE_TAG\` does not exist in ECR repository \`$ECR_REPOSITORY\`." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This usually means:" >> $GITHUB_STEP_SUMMARY
+            echo "1. The commit was never built (not merged to main)" >> $GITHUB_STEP_SUMMARY
+            echo "2. The development build failed" >> $GITHUB_STEP_SUMMARY
+            echo "3. The image was manually deleted from ECR" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Action Required**: Ensure the commit is built by merging to main first." >> $GITHUB_STEP_SUMMARY
+
+            echo "❌ Error: API image not found in ECR"
+            echo "Image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            echo ""
+            echo "This tag points to a commit that was never built."
+            echo "Ensure the commit is merged to main and built before tagging for production."
+            exit 1
+          fi
+{% if MIGRATIONS_ENABLED %}
+      - name: Verify migrations image exists in ECR
+        env:
+          MIGRATIONS_IMAGE: ${{ '{{' }} steps.migrations.outputs.migrations_image {{ '}}' }}
+        run: |
+          echo "Verifying migrations image exists: $MIGRATIONS_IMAGE"
+
+          # Parse the image URI to extract repository and tag
+          # Format: registry/repository:tag
+          REGISTRY_AND_REPO="${MIGRATIONS_IMAGE%:*}"
+          MIGRATIONS_TAG="${MIGRATIONS_IMAGE##*:}"
+          MIGRATIONS_REPO="${REGISTRY_AND_REPO##*/}"
+
+          echo "Repository: $MIGRATIONS_REPO"
+          echo "Tag: $MIGRATIONS_TAG"
+
+          if aws ecr describe-images \
+            --repository-name "$MIGRATIONS_REPO" \
+            --image-ids imageTag="$MIGRATIONS_TAG" \
+            --region $AWS_REGION > /dev/null 2>&1; then
+            echo "✅ Migrations image found in ECR"
+
+            # Get image details
+            MIGRATIONS_DIGEST=$(aws ecr describe-images \
+              --repository-name "$MIGRATIONS_REPO" \
+              --image-ids imageTag="$MIGRATIONS_TAG" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)
+
+            MIGRATIONS_PUSHED=$(aws ecr describe-images \
+              --repository-name "$MIGRATIONS_REPO" \
+              --image-ids imageTag="$MIGRATIONS_TAG" \
+              --query 'imageDetails[0].imagePushedAt' \
+              --output text)
+
+            echo "## Migrations Image Verification" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Image exists in ECR" >> $GITHUB_STEP_SUMMARY
+            echo "- **Image**: \`$MIGRATIONS_IMAGE\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Digest**: \`$MIGRATIONS_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Pushed**: $MIGRATIONS_PUSHED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Migrations Image Not Found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The pinned migrations image does not exist in ECR:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "$MIGRATIONS_IMAGE" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Action Required**:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Build and push the migrations image from the migrations repository" >> $GITHUB_STEP_SUMMARY
+            echo "2. Update \`{{ VERSIONS_FILE }}\` with the correct image URI" >> $GITHUB_STEP_SUMMARY
+            echo "3. Create a new release tag" >> $GITHUB_STEP_SUMMARY
+
+            echo "❌ Error: Pinned migrations image not found in ECR"
+            echo "Image: $MIGRATIONS_IMAGE"
+            echo ""
+            echo "Build and push the migrations image before releasing."
+            exit 1
+          fi
+{% endif %}
+      - name: Download ECS task definition
+        run: |
+          # SOURCE OF TRUTH: GitHub Environment Variable (production)
+          ECS_TASK_DEFINITION="${{ '{{' }} vars.ECS_TASK_DEFINITION {{ '}}' }}"
+
+          echo "Downloading task definition: $ECS_TASK_DEFINITION"
+          aws ecs describe-task-definition \
+            --task-definition $ECS_TASK_DEFINITION \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with API image
+        id: task-def-api
+        env:
+          ECR_REGISTRY: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}
+          IMAGE_TAG: ${{ '{{' }} steps.resolve.outputs.image_tag {{ '}}' }}
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ '{{' }} env.CONTAINER_NAME {{ '}}' }}
+          image: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}/${{ '{{' }} env.ECR_REPOSITORY {{ '}}' }}:${{ '{{' }} steps.resolve.outputs.image_tag {{ '}}' }}
+{% if MIGRATIONS_ENABLED %}
+      - name: Update task definition with migrations image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ '{{' }} steps.task-def-api.outputs.task-definition {{ '}}' }}
+          container-name: ${{ '{{' }} env.MIGRATIONS_CONTAINER_NAME {{ '}}' }}
+          image: ${{ '{{' }} steps.migrations.outputs.migrations_image {{ '}}' }}
+{% endif %}
+      - name: Deploy to Production ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ '{{' }} steps.task-def{% if not MIGRATIONS_ENABLED %}-api{% endif %}.outputs.task-definition {{ '}}' }}
+          # SOURCE OF TRUTH: GitHub Environment Variable (production)
+          service: ${{ '{{' }} vars.ECS_SERVICE {{ '}}' }}
+          # SOURCE OF TRUTH: GitHub Environment Variable (production)
+          cluster: ${{ '{{' }} vars.ECS_CLUSTER {{ '}}' }}
+          wait-for-service-stability: true
+
+      - name: Create GitHub Release
+        id: create-release
+        env:
+          GH_TOKEN: ${{ '{{' }} github.token {{ '}}' }}
+          GIT_TAG: ${{ '{{' }} steps.resolve.outputs.git_tag {{ '}}' }}
+          FULL_SHA: ${{ '{{' }} steps.resolve.outputs.full_sha {{ '}}' }}
+        run: |
+          echo "Creating GitHub Release for tag $GIT_TAG..."
+
+          # Check if release already exists
+          if gh release view "$GIT_TAG" > /dev/null 2>&1; then
+            echo "ℹ️ Release already exists for tag $GIT_TAG"
+            RELEASE_URL=$(gh release view "$GIT_TAG" --json url -q .url)
+            echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+            echo "release_created=false" >> $GITHUB_OUTPUT
+          else
+            # Create release with auto-generated notes
+            gh release create "$GIT_TAG" \
+              --title "$GIT_TAG" \
+              --generate-notes \
+              --notes-start-tag "$(git describe --tags --abbrev=0 $GIT_TAG^ 2>/dev/null || echo '')"
+
+            RELEASE_URL=$(gh release view "$GIT_TAG" --json url -q .url)
+            echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+            echo "release_created=true" >> $GITHUB_OUTPUT
+
+            echo "✅ GitHub Release created: $RELEASE_URL"
+          fi
+
+      - name: Production Deployment Summary
+        env:
+          GIT_TAG: ${{ '{{' }} steps.resolve.outputs.git_tag {{ '}}' }}
+          FULL_SHA: ${{ '{{' }} steps.resolve.outputs.full_sha {{ '}}' }}
+          IMAGE_TAG: ${{ '{{' }} steps.resolve.outputs.image_tag {{ '}}' }}
+          ECR_REGISTRY: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}
+{% if MIGRATIONS_ENABLED %}
+          MIGRATIONS_IMAGE: ${{ '{{' }} steps.migrations.outputs.migrations_image {{ '}}' }}
+{% endif %}
+          RELEASE_URL: ${{ '{{' }} steps.create-release.outputs.release_url {{ '}}' }}
+          RELEASE_CREATED: ${{ '{{' }} steps.create-release.outputs.release_created {{ '}}' }}
+        run: |
+          echo "## 🚀 Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: Production" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: \`$GIT_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA**: \`$FULL_SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Cluster**: \`${{ '{{' }} vars.ECS_CLUSTER {{ '}}' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Service**: \`${{ '{{' }} vars.ECS_SERVICE {{ '}}' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployed Images" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**API Container:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+{% if MIGRATIONS_ENABLED %}
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Migrations Init Container:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$MIGRATIONS_IMAGE" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY{% endif %}
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "$RELEASE_CREATED" = "true" ]; then
+            echo "### 📝 GitHub Release" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Release created: [$GIT_TAG]($RELEASE_URL)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 📝 GitHub Release" >> $GITHUB_STEP_SUMMARY
+            echo "ℹ️ Release already exists: [$GIT_TAG]($RELEASE_URL)" >> $GITHUB_STEP_SUMMARY
+          fi

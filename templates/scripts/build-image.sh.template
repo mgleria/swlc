@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Build the Docker image for deployment
+# Use --platform to ensure linux/amd64 compatibility for AWS ECS/Fargate
+
+# Configuration
+IMAGE_NAME='{{ PROJECT_NAME }}'
+TAG='local'
+AWS_ACCOUNT_ID='{{ AWS_ACCOUNT_ID }}'
+AWS_REGION='{{ AWS_REGION }}'
+ECR_REPO='{{ ECR_REPOSITORY }}'
+
+# Build arguments - Set these as needed for your environment
+{% if BUILD_ARGS -%}
+{% for arg in BUILD_ARGS -%}
+{{ arg }}="${ {{- arg }} :-}"  # {% if arg == 'NPM_TOKEN' %}Optional: Set if using private npm packages{% else %}Build-time variable{% endif %}
+{% endfor -%}
+{% endif -%}
+# Build the image
+echo "Building Docker image: $IMAGE_NAME:$TAG"
+echo "  Platform: linux/amd64"
+{% if BUILD_ARGS -%}
+{% for arg in BUILD_ARGS -%}
+echo "  {{ arg }}: ${ {{- arg }} :-(not set)}"
+{% endfor -%}
+{% endif -%}
+echo ""
+
+docker buildx build \
+  --platform linux/amd64 \
+{% if BUILD_ARGS -%}
+{% for arg in BUILD_ARGS -%}
+  --build-arg {{ arg }}="${ {{- arg }} }" \
+{% endfor -%}
+{% endif -%}
+  -t $IMAGE_NAME:$TAG \
+  --load \
+  .
+
+if [ $? -eq 0 ]; then
+  echo ""
+  echo "✓ Image built successfully: $IMAGE_NAME:$TAG"
+  echo ""
+  echo "To push to AWS ECR:"
+  echo "  1. Authenticate: aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+  echo "  2. Tag: docker tag $IMAGE_NAME:$TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$TAG"
+  echo "  3. Push: docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$TAG"
+else
+  echo ""
+  echo "✗ Build failed!"
+  exit 1
+fi

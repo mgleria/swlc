@@ -1,0 +1,224 @@
+# Software Lifecycle Configuration Template
+# This file defines GitHub Actions workflows and Docker setup for your project
+#
+# IMPORTANT: Copy this file to project.yaml and customize for your project.
+# Consider gitignoring project.yaml if it contains sensitive information.
+
+project:
+  # Project identifier (lowercase, alphanumeric, hyphens only)
+  # Used for: repository names, docker images, etc.
+  name: myproject
+
+  # Project type: nodejs-server, nextjs-webapp, or knex-migration
+  type: nodejs-server  # or nextjs-webapp, knex-migration
+
+  # Repository path (relative or absolute)
+  # Where workflows and Docker files will be generated
+  repository_path: ../myproject
+
+  # AWS Configuration (for ECR deployments)
+  aws:
+    region: us-east-1
+    ecr_repository: myproject-api
+    # account_id is determined automatically during workflow execution
+
+  # GitHub Configuration
+  github:
+    org: myorg
+    repo: myproject
+    main_branch: main
+
+# Environments Configuration
+# For nodejs-server and nextjs-webapp, define multiple environments
+# For knex-migration, environments are not used
+environments:
+  development:
+    enabled: true
+
+    # Trigger configuration
+    trigger:
+      # For nodejs-server and nextjs-webapp: push to main
+      # For knex-migration: push to main (builds immediately)
+      type: push
+      branch: main
+      paths_ignore:
+        - '.github/**'
+
+    # GitHub environment name (for secrets and variables)
+    github_environment: development
+
+    # ECS/Deployment configuration (if using ECS)
+    deployment:
+      enabled: true
+      ecs_cluster: development-cluster
+      ecs_service: development-api
+      ecs_task_definition: development-api
+      container_name: api
+
+    # Migration-specific config (only for nodejs-server with migrations)
+    migrations:
+      enabled: true
+      image: "123456789012.dkr.ecr.us-east-1.amazonaws.com/myproject-knex:sha-abc123"
+      container_name: migration
+      # Path to versions file (optional, for tracking migration versions)
+      versions_file: deploy/versions.yml
+
+    # Build-time environment variables (for nextjs-webapp)
+    # These are passed as --build-arg during docker build
+    build_args:
+      - NPM_TOKEN  # From GitHub secrets
+      - NEXT_PUBLIC_API_URL  # From GitHub vars
+      - NEXT_PUBLIC_ENV  # From GitHub vars
+
+  production:
+    enabled: true
+
+    # Trigger configuration
+    trigger:
+      # Tag-based release for production
+      type: tag
+      tag_pattern: 'v*'
+
+    github_environment: production
+
+    deployment:
+      enabled: true
+      ecs_cluster: production-cluster
+      ecs_service: production-api
+      ecs_task_definition: production-api
+      container_name: api
+
+    migrations:
+      enabled: true
+      image: "123456789012.dkr.ecr.us-east-1.amazonaws.com/myproject-knex:sha-abc123"
+      container_name: migration
+      versions_file: deploy/versions.yml
+
+    build_args:
+      - NPM_TOKEN
+      - NEXT_PUBLIC_API_URL
+      - NEXT_PUBLIC_ENV
+
+    # Production-specific validations
+    validations:
+      # Verify tag matches package.json version
+      verify_version: true
+      # Verify tag is from main branch
+      verify_branch: true
+      # For nodejs-server: verify image exists in ECR before deploying
+      verify_image_exists: true
+
+# Docker Configuration
+docker:
+  # Enable Docker file generation
+  generate_dockerfile: true
+
+  # Enable build-image.sh script generation
+  generate_build_script: true
+
+  # Platform target (for AWS ECS/Fargate)
+  platform: linux/amd64
+
+  # Dockerfile settings based on project type
+  # For nodejs-server
+  nodejs_server:
+    base_image: node:22-alpine
+    work_dir: /var/api
+    port: 3020
+    health_check_path: /health
+    # If your project has a blockchain subproject (like the reference)
+    has_blockchain: false
+
+  # For nextjs-webapp
+  nextjs_webapp:
+    base_image: node:22-alpine
+    work_dir: /var/webapp
+    port: 3000
+    health_check_path: /api/health
+    # Next.js specific settings
+    output: standalone  # Required for Docker deployment
+
+  # For knex-migration
+  knex_migration:
+    base_image: node:22-alpine
+    work_dir: /app
+    # No port or health check needed for migration containers
+
+# Release Script Configuration (for nodejs-server and nextjs-webapp)
+release:
+  # Generate release-prod.mjs script
+  generate_script: true
+
+  # Script behavior
+  require_clean_tree: true
+  require_main_branch: true
+  verify_package_version: true
+  prevent_downgrades: true
+
+  # Create GitHub release after deployment
+  create_github_release: true
+
+# GitHub Secrets and Variables Configuration
+# This section documents what secrets/variables need to be created
+github_secrets:
+  # Global secrets (not environment-specific)
+  global:
+    - name: NPM_TOKEN
+      description: "NPM authentication token for private packages"
+      required: false
+
+  # Environment-specific secrets
+  environments:
+    development:
+      secrets:
+        - name: AWS_ROLE_TO_ASSUME
+          description: "AWS IAM Role ARN for GitHub OIDC authentication"
+          required: true
+      variables:
+        - name: ECS_CLUSTER
+          description: "ECS cluster name for development"
+          required: true
+          example: "development-cluster"
+        - name: ECS_SERVICE
+          description: "ECS service name for development"
+          required: true
+          example: "development-api"
+        - name: ECS_TASK_DEFINITION
+          description: "ECS task definition name for development"
+          required: true
+          example: "development-api"
+        - name: NEXT_PUBLIC_API_URL
+          description: "Public API URL for Next.js (build-time)"
+          required: false  # Only for nextjs-webapp
+          example: "https://api.dev.example.com"
+        - name: NEXT_PUBLIC_ENV
+          description: "Environment name for Next.js (build-time)"
+          required: false  # Only for nextjs-webapp
+          example: "development"
+
+    production:
+      secrets:
+        - name: AWS_ROLE_TO_ASSUME
+          description: "AWS IAM Role ARN for GitHub OIDC authentication"
+          required: true
+      variables:
+        - name: ECS_CLUSTER
+          description: "ECS cluster name for production"
+          required: true
+          example: "production-cluster"
+        - name: ECS_SERVICE
+          description: "ECS service name for production"
+          required: true
+          example: "production-api"
+        - name: ECS_TASK_DEFINITION
+          description: "ECS task definition name for production"
+          required: true
+          example: "production-api"
+        - name: NEXT_PUBLIC_API_URL
+          description: "Public API URL for Next.js (build-time)"
+          required: false
+          example: "https://api.example.com"
+        - name: NEXT_PUBLIC_ENV
+          description: "Environment name for Next.js (build-time)"
+          required: false
+          example: "production"

@@ -1,0 +1,91 @@
+{% if HAS_BLOCKCHAIN %}# ==============================================
+# STAGE 1: Build blockchain contracts
+# ==============================================
+FROM {{ BASE_IMAGE }} AS blockchain-builder
+
+WORKDIR /build/blockchain
+
+# Copy blockchain package files
+COPY blockchain/package*.json ./
+RUN npm ci
+
+# Copy blockchain source and compile
+COPY blockchain/ ./
+RUN npm run compile
+
+
+{% endif %}# ==============================================
+# STAGE {% if HAS_BLOCKCHAIN %}2{% else %}1{% endif %}: Build application
+# ==============================================
+FROM {{ BASE_IMAGE }} AS builder
+
+{% if BUILD_ARGS %}{% for arg in BUILD_ARGS %}ARG {{ arg }}
+{% endfor %}{% endif %}WORKDIR /build
+
+# Configure npm authentication{% if 'NPM_TOKEN' in BUILD_ARGS %}
+
+RUN if [ -n "$NPM_TOKEN" ]; then \
+    echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc; \
+    fi{% endif %}
+
+
+# Copy package files first (better caching)
+COPY package*.json ./
+RUN npm ci{% if 'NPM_TOKEN' in BUILD_ARGS %} && rm -f .npmrc{% endif %}
+
+
+# Copy TypeScript config
+COPY tsconfig.json ./
+
+# Copy source code
+COPY src ./src
+COPY scripts ./scripts
+{% if HAS_BLOCKCHAIN %}
+# Copy blockchain artifacts from previous stage
+COPY --from=blockchain-builder /build/blockchain ./blockchain
+{% endif %}
+# Build application
+RUN npm run build
+
+
+# ==============================================
+# STAGE {% if HAS_BLOCKCHAIN %}3{% else %}2{% endif %}: Production image
+# ==============================================
+FROM {{ BASE_IMAGE }} AS production
+
+{% if BUILD_ARGS %}{% for arg in BUILD_ARGS %}ARG {{ arg }}
+{% endfor %}{% endif %}WORKDIR {{ WORK_DIR }}
+
+# Configure npm authentication{% if 'NPM_TOKEN' in BUILD_ARGS %}
+
+RUN if [ -n "$NPM_TOKEN" ]; then \
+    echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc; \
+    fi{% endif %}
+
+
+# Copy package files and install production dependencies only
+COPY package*.json ./
+RUN npm ci --only=production{% if 'NPM_TOKEN' in BUILD_ARGS %} && \
+    rm -f .npmrc{% endif %} && \
+    npm cache clean --force
+
+# Copy built application from builder
+COPY --from=builder /build/dist ./dist
+{% if HAS_BLOCKCHAIN %}
+# Copy blockchain artifacts (if needed at runtime)
+COPY --from=blockchain-builder /build/blockchain/artifacts ./blockchain/artifacts
+{% endif %}
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001 && \
+    chown -R nodejs:nodejs {{ WORK_DIR }}
+
+USER nodejs
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s \
+  CMD node -e "require('http').get('http://localhost:{{ PORT }}{{ HEALTH_CHECK_PATH }}', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+
+EXPOSE {{ PORT }}
+
+CMD ["node", "dist/server.js"]
