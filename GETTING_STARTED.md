@@ -11,12 +11,15 @@ This guide will walk you through bootstrapping GitHub Actions workflows for your
 
    # gh - GitHub CLI (optional, for setting up secrets/variables)
    brew install gh
-
-   # Python 3 with Jinja2 (for template rendering)
-   pip3 install jinja2
    ```
 
-2. **Prepare Your Project:**
+2. **Set Up SWLC:**
+   ```bash
+   cd sw-lifecycle
+   make setup  # Creates Python venv and installs jinja2
+   ```
+
+3. **Prepare Your Target Project:**
    - Your project should have a `package.json`
    - For TypeScript projects: `tsconfig.json`
    - Source code in `src/` directory
@@ -27,14 +30,14 @@ This guide will walk you through bootstrapping GitHub Actions workflows for your
 ### Step 1: Bootstrap Configuration
 
 ```bash
-cd infrastructure-templates/sw-lifecycle
 make bootstrap
 ```
 
 This interactive script will prompt you for:
 - **Project name**: `myapi` (lowercase, alphanumeric, hyphens)
+  - This creates `outputs/myapi/` directory for all generated files
 - **Project type**: Select `nodejs-server`
-- **Repository path**: `/path/to/your/api`
+- **Repository path (optional)**: `/path/to/your/api` (for reference only)
 - **AWS region**: `us-east-1`
 - **ECR repository**: `myapi`
 - **GitHub org/repo**: `myorg/myapi`
@@ -50,57 +53,58 @@ Docker configuration:
 - Health check path (default: /health)
 - Whether project has blockchain sub-project
 
+This creates `outputs/myapi/project.yaml` with your configuration.
+
 ### Step 2: Validate Configuration
 
 ```bash
-make validate
+make validate PROJECT=myapi
 ```
 
 This checks that all required fields are present and valid.
 
-### Step 3: Check Docker Readiness
+**Note**: If you only have one project in `outputs/`, you can omit `PROJECT=myapi`.
+
+### Step 3: Generate All Files
 
 ```bash
-make check-docker-ready
+make generate-all PROJECT=myapi
 ```
 
-This validates your project structure:
-- ✓ package.json with build/start scripts
-- ✓ src/ directory
-- ✓ TypeScript configuration (if applicable)
-- ✓ Server entry point (src/server.ts)
-- ✓ Migrations directory (if enabled)
-
-### Step 4: Generate All Files
-
-```bash
-make generate-all
-```
-
-This generates:
-1. **GitHub Actions workflows** in `<your-repo>/.github/workflows/`:
+This generates files in `outputs/myapi/`:
+1. **GitHub Actions workflows** in `.github/workflows/`:
    - `build-and-deploy-development.yml`
    - `deploy-production-and-release.yml`
 
-2. **Dockerfile** in `<your-repo>/`
+2. **Dockerfile** at root level
 
-3. **Build script** in `<your-repo>/build-image.sh`
+3. **Build script** `build-image.sh` at root level
 
-4. **Release script** in `<your-repo>/scripts/release-prod.mjs`
+4. **Release script** in `scripts/release-prod.mjs`
 
-5. **GitHub CLI snippets** in `generated/gh-cli-snippets.sh`
+5. **GitHub CLI snippets** in `gh-cli-snippets.sh`
+
+### Step 4: Copy Generated Files to Your Repository
+
+```bash
+# Copy all generated files to your target repository
+cp -r outputs/myapi/.github /path/to/your/api/
+cp outputs/myapi/Dockerfile /path/to/your/api/
+cp outputs/myapi/build-image.sh /path/to/your/api/
+cp -r outputs/myapi/scripts /path/to/your/api/
+```
 
 ### Step 5: Set Up GitHub Secrets/Variables
 
 ```bash
 # Review the generated script
-cat generated/gh-cli-snippets.sh
+cat outputs/myapi/gh-cli-snippets.sh
 
 # Edit placeholder values (AWS Role ARNs, etc.)
-vim generated/gh-cli-snippets.sh
+vim outputs/myapi/gh-cli-snippets.sh
 
 # Run the script
-bash generated/gh-cli-snippets.sh
+bash outputs/myapi/gh-cli-snippets.sh
 ```
 
 The script creates:
@@ -116,7 +120,9 @@ The script creates:
 **Global Secrets** (optional):
 - `NPM_TOKEN` - if using private npm packages
 
-### Step 6: Test Docker Build Locally
+### Step 6: Test Docker Build Locally (Optional)
+
+Before committing, you can test the Docker build locally:
 
 ```bash
 cd /path/to/your/api
@@ -130,7 +136,7 @@ export NPM_TOKEN="your-npm-token"
 
 ### Step 7: Create Migrations Version File (if using migrations)
 
-If you enabled migrations, create `deploy/versions.yml`:
+If you enabled migrations, create `deploy/versions.yml` in your repository:
 
 ```yaml
 migrations_image: "123456789012.dkr.ecr.us-east-1.amazonaws.com/myapi-knex:sha-abc123"

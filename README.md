@@ -10,6 +10,17 @@ This bootstrap system helps you quickly set up CI/CD workflows for three common 
 2. **NextJS Webapp** - Frontend applications with build-time environment variables
 3. **Knex Migration** - Database migration containers (sidecar pattern)
 
+## How It Works
+
+SWLC is a **code generator** that creates CI/CD configurations from templates:
+
+1. **Bootstrap**: Run `make bootstrap` to interactively configure a new project
+2. **Generate**: Run `make generate-all` to create all files in `outputs/<project-name>/`
+3. **Copy**: Manually copy the generated files to your target repository
+4. **Commit**: Add, commit, and push the files in your target repository
+
+**Multi-Project Support**: You can manage multiple projects from one SWLC installation. Each project gets its own `outputs/<project-name>/` directory with independent configuration.
+
 ## Features
 
 - **Interactive Bootstrap** - Guided setup with smart defaults
@@ -26,10 +37,7 @@ This bootstrap system helps you quickly set up CI/CD workflows for three common 
 ```bash
 # Required
 brew install yq      # YAML processor
-brew install python3 # Python 3 (if not already installed)
-
-# Install Python dependencies
-pip3 install jinja2  # Template engine
+make setup           # Sets up Python venv with jinja2
 
 # Optional (for deployment)
 brew install gh      # GitHub CLI (for setting up secrets/variables)
@@ -38,41 +46,60 @@ brew install gh      # GitHub CLI (for setting up secrets/variables)
 ### 2. Bootstrap Your Project
 
 ```bash
-cd infrastructure-templates/sw-lifecycle
 make bootstrap
 ```
 
 This will interactively prompt you for:
-- Project name and type
-- Repository path
-- AWS configuration (region, ECR repository)
-- GitHub configuration (org, repo, branch)
-- Environment-specific settings (ECS cluster, service names)
-- Docker configuration (ports, health checks)
-- Migration settings (if applicable)
+- **Project name** - Used to create `outputs/<project-name>/` directory
+- **Project type** - nodejs-server, nextjs-webapp, or knex-migration
+- **Repository path (optional)** - Reference only, for convenience
+- **AWS configuration** - Region and ECR repository
+- **GitHub configuration** - Organization, repository, and main branch
+- **Environment settings** - ECS cluster, service, and task definition names
+- **Docker configuration** - Ports, health checks, and build settings
+- **Migration settings** - If using database migrations
+
+All configuration is saved to `outputs/<project-name>/project.yaml`.
 
 ### 3. Generate All Files
 
 ```bash
-make generate-all
+make generate-all PROJECT=<project-name>
 ```
 
-This generates:
-- GitHub Actions workflows (`.github/workflows/`)
-- Dockerfile
-- `build-image.sh` script
-- `scripts/release-prod.mjs` (for nodejs-server and nextjs-webapp)
-- GitHub secrets/variables setup snippets
+This generates files in `outputs/<project-name>/`:
+- `.github/workflows/` - GitHub Actions workflows
+- `Dockerfile` - Docker build configuration
+- `build-image.sh` - Local Docker build script
+- `scripts/release-prod.mjs` - Release automation script
+- `gh-cli-snippets.sh` - GitHub secrets/variables setup commands
 
-### 4. Set Up GitHub Secrets/Variables
+**Note**: If you only have one project, `PROJECT=<project-name>` can be omitted.
+
+### 4. Copy Generated Files to Your Repository
 
 ```bash
-make generate-secrets-snippets
-# Review generated/gh-cli-snippets.sh
-# Run the commands to create secrets and variables
+# Copy the generated files to your target repository
+cp -r outputs/<project-name>/.github /path/to/your/project/
+cp outputs/<project-name>/Dockerfile /path/to/your/project/
+cp outputs/<project-name>/build-image.sh /path/to/your/project/
+cp -r outputs/<project-name>/scripts /path/to/your/project/
 ```
 
-### 5. Commit and Push
+### 5. Set Up GitHub Secrets/Variables
+
+```bash
+# Review the generated script
+cat outputs/<project-name>/gh-cli-snippets.sh
+
+# Edit with your AWS Role ARNs and other values
+vim outputs/<project-name>/gh-cli-snippets.sh
+
+# Run the commands to create secrets and variables
+bash outputs/<project-name>/gh-cli-snippets.sh
+```
+
+### 6. Commit and Push
 
 ```bash
 cd /path/to/your/project
@@ -80,6 +107,61 @@ git add .github/workflows/ Dockerfile build-image.sh scripts/
 git commit -m "Add CI/CD workflows and Docker setup"
 git push
 ```
+
+## Common Commands
+
+### First-Time Setup
+```bash
+# Install Python venv and dependencies
+make setup
+```
+
+### Bootstrap New Project
+```bash
+# Interactive wizard to create new project configuration
+make bootstrap
+```
+
+This creates `outputs/<project-name>/project.yaml` with your configuration.
+
+### Generate Files
+
+```bash
+# Generate all files (auto-discovers project if only one exists)
+make generate-all
+
+# Generate for specific project (required if multiple projects)
+make generate-all PROJECT=myproject
+
+# Generate specific file types
+make generate-workflows PROJECT=myproject    # GitHub Actions workflows only
+make generate-docker PROJECT=myproject       # Dockerfile and build script only
+make generate-release-script PROJECT=myproject  # Release script only
+make generate-secrets-snippets PROJECT=myproject  # GitHub CLI snippets only
+```
+
+### Validation
+```bash
+# Validate project configuration
+make validate PROJECT=myproject
+
+# Check if target repository is Docker-ready
+make check-docker-ready PROJECT=myproject
+
+# Show current configuration
+make show-config PROJECT=myproject
+```
+
+### Utilities
+```bash
+# List all available commands
+make help
+
+# Clean generated files (keeps project.yaml)
+make clean PROJECT=myproject
+```
+
+**Note**: `PROJECT=<name>` can be omitted if you only have one project in `outputs/`.
 
 ## Project Types
 
@@ -143,9 +225,9 @@ See `config/project.yaml.template` for full configuration options.
 
 ```yaml
 project:
-  name: myproject
+  name: myproject                 # Used for outputs/<project-name>/ directory
   type: nodejs-server | nextjs-webapp | knex-migration
-  repository_path: /path/to/project
+  repository_path: /path/to/project  # Optional: reference for your convenience
 
   aws:
     region: us-east-1
@@ -196,9 +278,9 @@ release:
 ```
 sw-lifecycle/
 ├── config/
-│   ├── project.yaml.template      # Configuration template
-│   └── project.yaml               # Your project config (gitignored)
-├── templates/
+│   └── project.yaml.template      # Configuration template (used by bootstrap)
+│
+├── templates/                     # Jinja2 templates for code generation
 │   ├── workflows/                 # GitHub Actions workflow templates
 │   │   ├── nodejs-server-development.yml.template
 │   │   ├── nodejs-server-production.yml.template
@@ -212,20 +294,39 @@ sw-lifecycle/
 │   └── scripts/                   # Script templates
 │       ├── build-image.sh.template
 │       └── release-prod.mjs.template
-├── scripts/
-│   ├── bootstrap-project.sh       # Interactive bootstrap
-│   ├── generate-all.sh            # Generate all files
+│
+├── scripts/                       # Generation and utility scripts
+│   ├── bootstrap-project.sh       # Interactive bootstrap wizard
+│   ├── generate-all.sh            # Generate all files for a project
 │   ├── generate-workflows.sh      # Generate workflows only
 │   ├── generate-docker.sh         # Generate Docker files only
 │   ├── generate-release-script.sh # Generate release script
 │   ├── generate-secrets-snippets.sh # Generate gh CLI commands
 │   ├── validate-config.sh         # Validate project.yaml
-│   └── check-docker-ready.sh      # Validate project structure
+│   ├── check-docker-ready.sh      # Validate project structure
+│   ├── render-template.py         # Jinja2 template renderer
+│   ├── setup-venv.sh              # Python venv setup
+│   └── activate-venv.sh           # Venv activation helper
+│
+├── outputs/                       # Generated files (gitignored)
+│   ├── project-1/                 # Each project gets its own directory
+│   │   ├── project.yaml           # Project configuration
+│   │   ├── .github/workflows/     # Generated workflows (ready to copy)
+│   │   ├── Dockerfile             # Generated Dockerfile
+│   │   ├── build-image.sh         # Generated build script
+│   │   ├── scripts/               # Generated scripts
+│   │   │   └── release-prod.mjs
+│   │   └── gh-cli-snippets.sh     # GitHub CLI commands
+│   └── project-2/
+│       └── ...
+│
 ├── examples/                      # Example configurations
 │   ├── nodejs-server-example.yaml
 │   ├── nextjs-webapp-example.yaml
 │   └── knex-migration-example.yaml
-├── Makefile                       # Main commands
+│
+├── .venv/                         # Python virtual environment (gitignored)
+├── Makefile                       # Main entry point - run `make help`
 └── README.md                      # This file
 ```
 
