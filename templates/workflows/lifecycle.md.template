@@ -1,0 +1,38 @@
+# Deployment Guide
+
+## Deploy to Development
+
+Merge your branch to `{{ MAIN_BRANCH }}`. That's it — GitHub Actions builds and deploys automatically.
+
+```
+feature branch → PR → merge to {{ MAIN_BRANCH }} → auto-deploy to dev
+```
+
+## Deploy to Production
+
+From `{{ MAIN_BRANCH }}`, run:
+
+```bash
+npm run release:prod
+```
+
+The script will:
+1. Validate you're on `{{ MAIN_BRANCH }}`, synced with origin, clean working tree
+2. Read the version from `package.json`
+3. Create a git tag `vX.Y.Z` and push it
+4. GitHub Actions picks up the tag and deploys to production
+
+To bump the version first, update `package.json` manually (or `npm version patch/minor/major`), commit, push, then run `release:prod`.
+
+### Options
+
+```bash
+npm run release:prod -- --dry-run   # Validate everything without actually releasing
+npm run release:prod -- --yes       # Skip confirmation prompt
+```
+
+## Rollback
+
+**Dev:** Revert the commit on `{{ MAIN_BRANCH }}` and push. A new deployment triggers automatically.
+
+**Prod:** Revert the commit, push to `{{ MAIN_BRANCH }}`, bump version, then `npm run release:prod`.

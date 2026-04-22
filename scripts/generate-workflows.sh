@@ -180,7 +180,65 @@ EOF
     fi
 
 elif [ "$PROJECT_TYPE" = "nextjs-webapp" ]; then
-    print_info "NextJS webapp workflows not yet implemented (coming in phase 2)"
+    # Generate development workflow
+    DEV_ENABLED=$(yq eval '.environments.development.enabled' "$CONFIG_FILE")
+    if [ "$DEV_ENABLED" = "true" ]; then
+        print_info "Generating development workflow..."
+
+        DEV_CLUSTER=$(yq eval '.environments.development.deployment.ecs_cluster' "$CONFIG_FILE")
+        DEV_SERVICE=$(yq eval '.environments.development.deployment.ecs_service' "$CONFIG_FILE")
+        DEV_TASK_DEF=$(yq eval '.environments.development.deployment.ecs_task_definition' "$CONFIG_FILE")
+        DEV_CONTAINER=$(yq eval '.environments.development.deployment.container_name' "$CONFIG_FILE")
+
+        VARS_JSON=$(cat <<EOF
+{
+  "MAIN_BRANCH": "$MAIN_BRANCH",
+  "AWS_REGION": "$AWS_REGION",
+  "ECR_REPOSITORY": "$ECR_REPOSITORY",
+  "CONTAINER_NAME": "$DEV_CONTAINER",
+  "ECS_CLUSTER": "$DEV_CLUSTER",
+  "ECS_SERVICE": "$DEV_SERVICE",
+  "ECS_TASK_DEFINITION": "$DEV_TASK_DEF"
+}
+EOF
+)
+
+        python3 "$SCRIPT_DIR/render-template.py" \
+            "$PROJECT_ROOT/templates/workflows/nextjs-webapp-development.yml.template" \
+            "$VARS_JSON" > "$OUTPUT_DIR/deploy-development.yml"
+
+        print_success "Generated deploy-development.yml"
+    fi
+
+    # Generate production workflow
+    PROD_ENABLED=$(yq eval '.environments.production.enabled' "$CONFIG_FILE")
+    if [ "$PROD_ENABLED" = "true" ]; then
+        print_info "Generating production workflow..."
+
+        PROD_CLUSTER=$(yq eval '.environments.production.deployment.ecs_cluster' "$CONFIG_FILE")
+        PROD_SERVICE=$(yq eval '.environments.production.deployment.ecs_service' "$CONFIG_FILE")
+        PROD_TASK_DEF=$(yq eval '.environments.production.deployment.ecs_task_definition' "$CONFIG_FILE")
+        PROD_CONTAINER=$(yq eval '.environments.production.deployment.container_name' "$CONFIG_FILE")
+
+        VARS_JSON=$(cat <<EOF
+{
+  "MAIN_BRANCH": "$MAIN_BRANCH",
+  "AWS_REGION": "$AWS_REGION",
+  "ECR_REPOSITORY": "$ECR_REPOSITORY",
+  "CONTAINER_NAME": "$PROD_CONTAINER",
+  "ECS_CLUSTER": "$PROD_CLUSTER",
+  "ECS_SERVICE": "$PROD_SERVICE",
+  "ECS_TASK_DEFINITION": "$PROD_TASK_DEF"
+}
+EOF
+)
+
+        python3 "$SCRIPT_DIR/render-template.py" \
+            "$PROJECT_ROOT/templates/workflows/nextjs-webapp-production.yml.template" \
+            "$VARS_JSON" > "$OUTPUT_DIR/deploy-production.yml"
+
+        print_success "Generated deploy-production.yml"
+    fi
 
 elif [ "$PROJECT_TYPE" = "knex-migration" ]; then
     print_info "Knex migration workflows not yet implemented (coming in phase 2)"
