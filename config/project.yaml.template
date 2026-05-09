@@ -20,7 +20,7 @@ project:
   aws:
     region: us-east-1
     ecr_repository: myproject-api
-    # account_id is determined automatically during workflow execution
+    ecr_account_id: "123456789012"  # AWS account where ECR repos live
 
   # GitHub Configuration
   github:
@@ -158,6 +158,22 @@ release:
   # Create GitHub release after deployment
   create_github_release: true
 
+# Doppler Webhook Configuration
+# Automates syncing Doppler secrets to S3 via the syncDopplerToS3 workflow.
+# One webhook per Doppler config (e.g., dev, prd) triggers a workflow_dispatch
+# on the GitHub repo with the matching environment as input.
+doppler:
+  # Doppler project name (as shown in Doppler dashboard)
+  project: myproject
+  # The syncDopplerToS3 workflow filename in the repo
+  sync_workflow: syncDopplerToS3.yaml
+  # Map each Doppler config to a GitHub environment
+  configs:
+    - name: dev
+      github_environment: development
+    - name: prd
+      github_environment: production
+
 # GitHub Secrets and Variables Configuration
 # This section documents what secrets/variables need to be created
 github_secrets:
@@ -167,13 +183,23 @@ github_secrets:
       description: "NPM authentication token for private packages"
       required: false
 
+  # Repository-level variables (not environment-scoped)
+  repository_variables:
+    - name: AWS_ACCOUNT_ID_DEVELOPMENT
+      description: "AWS account ID where ECR repos live (used for cross-account ECR login)"
+      required: true  # Required for nodejs-server and nextjs-webapp
+      example: "123456789012"
+
   # Environment-specific secrets
   environments:
     development:
       secrets:
         - name: AWS_ROLE_TO_ASSUME
-          description: "AWS IAM Role ARN for GitHub OIDC authentication"
+          description: "AWS IAM Role ARN for GitHub OIDC authentication (use arn:aws:iam:: format, NOT arn:aws:sts::)"
           required: true
+        - name: DOPPLER_TOKEN
+          description: "Doppler service token for environment variable injection"
+          required: false  # Only for nextjs-webapp
       variables:
         - name: ECS_CLUSTER
           description: "ECS cluster name for development"
@@ -199,8 +225,11 @@ github_secrets:
     production:
       secrets:
         - name: AWS_ROLE_TO_ASSUME
-          description: "AWS IAM Role ARN for GitHub OIDC authentication"
+          description: "AWS IAM Role ARN for GitHub OIDC authentication (use arn:aws:iam:: format, NOT arn:aws:sts::)"
           required: true
+        - name: DOPPLER_TOKEN
+          description: "Doppler service token for environment variable injection"
+          required: false  # Only for nextjs-webapp
       variables:
         - name: ECS_CLUSTER
           description: "ECS cluster name for production"

@@ -25,6 +25,7 @@
    - `generate-docker.sh` - Docker file generator
    - `generate-release-script.sh` - Release script generator
    - `generate-secrets-snippets.sh` - GitHub CLI snippets for secrets
+   - `generate-doppler-webhooks.sh` - Doppler webhook setup script
    - `validate-config.sh` - Configuration validation
    - `render-template.py` - Jinja2 template renderer
    - `setup-venv.sh` - Python virtual environment setup
@@ -71,6 +72,7 @@ outputs/
     ├── Dockerfile
     ├── build-image.sh
     ├── gh-cli-snippets.sh
+    ├── doppler-webhooks.sh
     └── scripts/
         └── release-prod.mjs
 ```
@@ -93,6 +95,7 @@ project:
   aws:
     region: string               # AWS region
     ecr_repository: string       # ECR repository name
+    ecr_account_id: string       # AWS account ID where ECR repos live
 
   github:
     org: string                  # GitHub organization
@@ -163,6 +166,13 @@ release:
   verify_package_version: boolean
   prevent_downgrades: boolean
   create_github_release: boolean
+
+doppler:
+  project: string               # Doppler project name
+  sync_workflow: string          # syncDopplerToS3 workflow filename (e.g., syncDopplerToS3.yaml)
+  configs:                       # One webhook per config
+    - name: string               # Doppler config slug (e.g., dev, prd, stg)
+      github_environment: string # GitHub environment to pass as workflow input
 ```
 
 ## Common Commands
@@ -201,6 +211,9 @@ make generate-release-script PROJECT=myproject
 
 # Generate GitHub CLI snippets
 make generate-secrets-snippets PROJECT=myproject
+
+# Generate Doppler webhook setup script
+make generate-doppler-webhooks PROJECT=myproject
 ```
 
 ### Utilities
@@ -271,6 +284,41 @@ make clean
    - Only create once per AWS account
    - Use `ExistingOIDCProviderArn` parameter if already exists
 
+6. **Cross-Account ECR Access**: When GitHub Actions role and ECR repo are in different AWS accounts
+   - Dev workflow needs `registries` parameter in ECR login step
+   - Prod workflow needs `AWS_ACCOUNT_ID_DEVELOPMENT` repo-level variable
+   - ECR repos need repository policies granting cross-account access
+   - **Critical**: Include `ecr:DescribeImages` in ECR policy (often forgotten)
+
+7. **AWS Role ARN Format**: Use IAM format, NOT STS format
+   - Correct: `arn:aws:iam::ACCOUNT:role/ROLE_NAME`
+   - Wrong: `arn:aws:sts::ACCOUNT:assumed-role/...`
+
+8. **Deployment Patterns**:
+   - `nodejs-server`: Build-once-and-promote (dev builds, prod pulls same image)
+   - `nextjs-webapp`: Build-per-environment (each env builds its own image with different build args)
+
+## Secrets & Environment Variables
+
+**Doppler is the source of truth** for all secrets and environment variables (runtime and build-time).
+
+### Flow: Doppler → S3 → ECS
+
+```
+Doppler (update secret)
+  → webhook triggers syncDopplerToS3 GitHub Actions workflow
+    → downloads .env from Doppler API, strips quotes
+      → uploads to S3 (s3://{bucket}/{env}/{app}/{env}/.env)
+        → ECS reads EnvironmentFiles on next task launch
+```
+
+- Doppler webhooks can be configured to auto-trigger `syncDopplerToS3` on every secret change (preferred, closes the loop fully)
+- If webhooks are not set up, sync can be triggered manually via workflow_dispatch or `make sync-env-to-s3`
+- ECS containers only read the S3 `.env` at task launch — a service restart or new deployment is needed to pick up changes
+- Quote stripping (`="value"` → `=value`) is critical for DNS resolution in ECS containers
+
+Doppler webhook creation is automated via `make generate-doppler-webhooks`, which generates a script with curl commands to create one webhook per Doppler config. Pre-requisites: a Doppler Personal Token (workplace-scoped) and a GitHub PAT (fine-grained) with `Actions: Read and Write` and `Metadata: Read` permissions.
+
 ## Future Enhancements
 
 ### Planned Features
@@ -319,6 +367,7 @@ sw-lifecycle/
 │   ├── generate-docker.sh
 │   ├── generate-release-script.sh
 │   ├── generate-secrets-snippets.sh
+│   ├── generate-doppler-webhooks.sh
 │   ├── validate-config.sh
 │   ├── check-docker-ready.sh
 │   ├── setup-venv.sh
@@ -328,7 +377,9 @@ sw-lifecycle/
 ├── templates/
 │   ├── workflows/
 │   │   ├── nodejs-server-development.yml.template
-│   │   └── nodejs-server-production.yml.template
+│   │   ├── nodejs-server-production.yml.template
+│   │   ├── nextjs-webapp-development.yml.template
+│   │   └── nextjs-webapp-production.yml.template
 │   ├── docker/
 │   │   └── nodejs-server.Dockerfile.template
 │   └── scripts/
@@ -402,5 +453,5 @@ ls -la outputs/test-project/
 
 ---
 
-**Last Updated**: 2026-01-29
-**Version**: 1.0 (Initial multi-project support)
+**Last Updated**: 2026-04-22
+**Version**: 1.1 (Hardened based on tbt deployment lessons: cross-account ECR, ecr_account_id, workflow_dispatch, ARN format guidance)
