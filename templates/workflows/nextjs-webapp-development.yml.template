@@ -1,0 +1,159 @@
+name: Deploy to Development (ECS)
+
+on:
+  push:
+    branches:
+      - {{ MAIN_BRANCH }}
+    paths-ignore:
+      - '.github/**'
+  workflow_dispatch:
+
+# Shared constants for readability
+env:
+  AWS_REGION: {{ AWS_REGION }}
+  ECR_REPOSITORY: {{ ECR_REPOSITORY }}
+  CONTAINER_NAME: {{ CONTAINER_NAME }}
+  # Dev-specific ECS resources (can be overridden by GitHub Environment vars if needed)
+  ECS_SERVICE: {{ ECS_SERVICE }}
+  ECS_CLUSTER: {{ ECS_CLUSTER }}
+  ECS_TASK_DEFINITION: {{ ECS_TASK_DEFINITION }}
+
+# Prevent concurrent dev deployments
+concurrency:
+  group: dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    # Version-bump commits from the release script push a tag that triggers
+    # production directly — redeploying dev on that same commit is pointless.
+    if: "!startsWith(github.event.head_commit.message, 'chore: release')"
+    # SOURCE OF TRUTH: GitHub Environment "development" for env-specific secrets/variables
+    environment: development
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Compute image tags
+      id: tags
+      run: |
+        TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+        SHORT_SHA=$(git rev-parse --short=7 HEAD)
+        FULL_SHA=$(git rev-parse HEAD)
+
+        # Dev image tags (immutable only, no latest)
+        TAG_TIMESTAMP="dev-${TIMESTAMP}-${SHORT_SHA}"
+        TAG_SHA="sha-${FULL_SHA}-dev"
+
+        echo "timestamp=${TAG_TIMESTAMP}" >> $GITHUB_OUTPUT
+        echo "sha=${TAG_SHA}" >> $GITHUB_OUTPUT
+        echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "full_sha=${FULL_SHA}" >> $GITHUB_OUTPUT
+
+    # SOURCE OF TRUTH: GitHub Environment Secret "development.AWS_ROLE_TO_ASSUME"
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: {% raw %}${{ secrets.AWS_ROLE_TO_ASSUME }}{% endraw %}
+        aws-region: {% raw %}${{ env.AWS_REGION }}{% endraw %}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      with:
+        registries: {% raw %}${{ vars.AWS_ACCOUNT_ID_DEVELOPMENT }}{% endraw %}
+
+    # Build — Doppler injects all env vars inside the Docker build via the service token.
+    # To add or change a variable, update the Doppler config; no workflow changes needed.
+    # DOPPLER_TOKEN is a GitHub Environment Secret scoped to "development".
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: {% raw %}${{ vars.AWS_ACCOUNT_ID_DEVELOPMENT }}{% endraw %}.dkr.ecr.{% raw %}${{ env.AWS_REGION }}{% endraw %}.amazonaws.com
+        TAG_TIMESTAMP: {% raw %}${{ steps.tags.outputs.timestamp }}{% endraw %}
+        TAG_SHA: {% raw %}${{ steps.tags.outputs.sha }}{% endraw %}
+        DOPPLER_TOKEN: {% raw %}${{ secrets.DOPPLER_TOKEN }}{% endraw %}
+      run: |
+        docker build \
+          --secret id=doppler_token,env=DOPPLER_TOKEN \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_TIMESTAMP \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_SHA \
+          .
+
+        # Push both immutable tags
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_TIMESTAMP
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_SHA
+
+        # Output the primary image reference for deployment
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG_TIMESTAMP" >> $GITHUB_OUTPUT
+        echo "image_timestamp=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG_TIMESTAMP" >> $GITHUB_OUTPUT
+        echo "image_sha=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG_SHA" >> $GITHUB_OUTPUT
+
+    # Download task definition from running ECS infrastructure (not from repo)
+    - name: Download task definition
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition {% raw %}${{ env.ECS_TASK_DEFINITION }}{% endraw %} \
+          --query taskDefinition > task-definition.json
+
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: {% raw %}${{ env.CONTAINER_NAME }}{% endraw %}
+        image: {% raw %}${{ steps.build-image.outputs.image }}{% endraw %}
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: {% raw %}${{ steps.task-def.outputs.task-definition }}{% endraw %}
+        service: {% raw %}${{ env.ECS_SERVICE }}{% endraw %}
+        cluster: {% raw %}${{ env.ECS_CLUSTER }}{% endraw %}
+        wait-for-service-stability: true
+
+    - name: Job Summary
+      if: always()
+      run: |
+        # Determine status emoji and message
+        if [ "{% raw %}${{ job.status }}{% endraw %}" == "success" ]; then
+          STATUS_EMOJI="✅"
+          STATUS_MSG="**Status:** Deployment successful"
+        elif [ "{% raw %}${{ job.status }}{% endraw %}" == "failure" ]; then
+          STATUS_EMOJI="❌"
+          STATUS_MSG="**Status:** Deployment failed"
+        else
+          STATUS_EMOJI="⚠️"
+          STATUS_MSG="**Status:** Deployment {% raw %}${{ job.status }}{% endraw %}"
+        fi
+
+        cat >> $GITHUB_STEP_SUMMARY <<EOF
+        ## ${STATUS_EMOJI} Development Deployment Summary
+
+        ${STATUS_MSG}
+
+        **Environment:** Development
+        **Commit:** \`{% raw %}${{ steps.tags.outputs.short_sha }}{% endraw %}\` (\`{% raw %}${{ steps.tags.outputs.full_sha }}{% endraw %}\`)
+        **Triggered by:** {% raw %}${{ github.actor }}{% endraw %}
+
+        ### 🏷️ Image Tags
+        - \`{% raw %}${{ steps.tags.outputs.timestamp }}{% endraw %}\`
+        - \`{% raw %}${{ steps.tags.outputs.sha }}{% endraw %}\`
+
+        ### 🎯 ECS Deployment
+        - **Cluster:** {% raw %}${{ env.ECS_CLUSTER }}{% endraw %}
+        - **Service:** {% raw %}${{ env.ECS_SERVICE }}{% endraw %}
+        - **Region:** {% raw %}${{ env.AWS_REGION }}{% endraw %}
+        - **Image:** \`{% raw %}${{ steps.build-image.outputs.image }}{% endraw %}\`
+
+        ### 🔗 Links
+        - [Commit]({% raw %}${{ github.event.head_commit.url }}{% endraw %})
+        - [Workflow Run]({% raw %}${{ github.server_url }}{% endraw %}/{% raw %}${{ github.repository }}{% endraw %}/actions/runs/{% raw %}${{ github.run_id }}{% endraw %})
+        EOF

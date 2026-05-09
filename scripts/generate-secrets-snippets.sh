@@ -50,6 +50,7 @@ fi
 PROJECT_TYPE=$(yq eval '.project.type' "$CONFIG_FILE")
 GITHUB_ORG=$(yq eval '.project.github.org' "$CONFIG_FILE")
 GITHUB_REPO=$(yq eval '.project.github.repo' "$CONFIG_FILE")
+ECR_ACCOUNT_ID=$(yq eval '.project.aws.ecr_account_id' "$CONFIG_FILE")
 
 # Create output directory
 # Get project name from config
@@ -152,6 +153,27 @@ print_header "Global Secrets"
 GLOBAL_SECRETS
 fi
 
+# Repository-level variables (not environment-scoped)
+if [ "$PROJECT_TYPE" != "knex-migration" ]; then
+    cat >> "$OUTPUT_FILE" << EOF
+# ====================================================================
+# Repository-Level Variables
+# ====================================================================
+
+print_header "Repository-Level Variables"
+
+# AWS_ACCOUNT_ID_DEVELOPMENT - needed for cross-account ECR access
+# The production workflow pulls images from the development ECR registry,
+# so it needs to know the development AWS account ID.
+echo "Creating AWS_ACCOUNT_ID_DEVELOPMENT variable (repo-level)..."
+gh variable set AWS_ACCOUNT_ID_DEVELOPMENT \\
+  --repo "\$REPO" \\
+  --body "${ECR_ACCOUNT_ID}"
+print_success "AWS_ACCOUNT_ID_DEVELOPMENT=${ECR_ACCOUNT_ID}"
+
+EOF
+fi
+
 # Environment-specific secrets and variables
 if [ "$PROJECT_TYPE" != "knex-migration" ]; then
     # Development environment
@@ -182,6 +204,8 @@ gh api \\
 # Secrets
 echo "Creating AWS_ROLE_TO_ASSUME secret for development..."
 print_warning "UPDATE THIS VALUE: Replace with your actual IAM Role ARN"
+print_warning "IMPORTANT: Use IAM format: arn:aws:iam::ACCOUNT:role/ROLE_NAME"
+print_warning "           NOT STS format: arn:aws:sts::ACCOUNT:assumed-role/..."
 gh secret set AWS_ROLE_TO_ASSUME \\
   --repo "\$REPO" \\
   --env development \\
@@ -229,6 +253,21 @@ print_success "NEXT_PUBLIC_ENV set"
 
 NEXTJS_DEV_VARS
         fi
+
+        # Add DOPPLER_TOKEN for nextjs-webapp
+        if [ "$PROJECT_TYPE" = "nextjs-webapp" ]; then
+            cat >> "$OUTPUT_FILE" << 'DOPPLER_DEV'
+# DOPPLER_TOKEN (for environment variable injection at build time)
+echo "Creating DOPPLER_TOKEN secret for development..."
+print_warning "UPDATE THIS VALUE: Replace with your actual Doppler service token"
+gh secret set DOPPLER_TOKEN \
+  --repo "$REPO" \
+  --env development \
+  --body "dp.st.development.XXXXXXXXXXXX"
+print_success "DOPPLER_TOKEN created"
+
+DOPPLER_DEV
+        fi
     fi
 
     # Production environment
@@ -259,6 +298,8 @@ gh api \\
 # Secrets
 echo "Creating AWS_ROLE_TO_ASSUME secret for production..."
 print_warning "UPDATE THIS VALUE: Replace with your actual IAM Role ARN"
+print_warning "IMPORTANT: Use IAM format: arn:aws:iam::ACCOUNT:role/ROLE_NAME"
+print_warning "           NOT STS format: arn:aws:sts::ACCOUNT:assumed-role/..."
 gh secret set AWS_ROLE_TO_ASSUME \\
   --repo "\$REPO" \\
   --env production \\
@@ -306,7 +347,99 @@ print_success "NEXT_PUBLIC_ENV set"
 
 NEXTJS_PROD_VARS
         fi
+
+        # Add DOPPLER_TOKEN for nextjs-webapp
+        if [ "$PROJECT_TYPE" = "nextjs-webapp" ]; then
+            cat >> "$OUTPUT_FILE" << 'DOPPLER_PROD'
+# DOPPLER_TOKEN (for environment variable injection at build time)
+echo "Creating DOPPLER_TOKEN secret for production..."
+print_warning "UPDATE THIS VALUE: Replace with your actual Doppler service token"
+gh secret set DOPPLER_TOKEN \
+  --repo "$REPO" \
+  --env production \
+  --body "dp.st.production.XXXXXXXXXXXX"
+print_success "DOPPLER_TOKEN created"
+
+DOPPLER_PROD
+        fi
     fi
+
+    # ECR Repository Policy Documentation
+    cat >> "$OUTPUT_FILE" << 'ECR_POLICY_DOCS'
+# ====================================================================
+# ECR Repository Policy (Cross-Account Access)
+# ====================================================================
+#
+# If your GitHub Actions role lives in a DIFFERENT AWS account than your
+# ECR repositories, you need to set a repository policy on each ECR repo
+# to allow cross-account access.
+#
+# CRITICAL: Include ecr:DescribeImages - this is often forgotten and
+# causes the "Verify image exists" step to fail in production workflows.
+#
+# --- API / Server repos (pull-only from production account) ---
+# The production account only needs to PULL images that were built and
+# pushed by the development account (build-once-and-promote pattern).
+#
+# aws ecr set-repository-policy \
+#   --repository-name YOUR_REPO_NAME \
+#   --policy-text '{
+#     "Version": "2012-10-17",
+#     "Statement": [{
+#       "Sid": "AllowCrossAccountPull",
+#       "Effect": "Allow",
+#       "Principal": {
+#         "AWS": "arn:aws:iam::PRODUCTION_ACCOUNT_ID:root"
+#       },
+#       "Action": [
+#         "ecr:GetDownloadUrlForLayer",
+#         "ecr:BatchGetImage",
+#         "ecr:BatchCheckLayerAvailability",
+#         "ecr:DescribeImages"
+#       ]
+#     }]
+#   }'
+#
+# --- Webapp repos (push+pull from both accounts) ---
+# Webapp images are built per-environment (build-per-environment pattern),
+# so the production account needs both push AND pull access.
+#
+# aws ecr set-repository-policy \
+#   --repository-name YOUR_REPO_NAME \
+#   --policy-text '{
+#     "Version": "2012-10-17",
+#     "Statement": [{
+#       "Sid": "AllowCrossAccountPushPull",
+#       "Effect": "Allow",
+#       "Principal": {
+#         "AWS": "arn:aws:iam::PRODUCTION_ACCOUNT_ID:root"
+#       },
+#       "Action": [
+#         "ecr:GetDownloadUrlForLayer",
+#         "ecr:BatchGetImage",
+#         "ecr:BatchCheckLayerAvailability",
+#         "ecr:DescribeImages",
+#         "ecr:PutImage",
+#         "ecr:InitiateLayerUpload",
+#         "ecr:UploadLayerPart",
+#         "ecr:CompleteLayerUpload"
+#       ]
+#     }]
+#   }'
+#
+# Deployment patterns:
+#   nodejs-server: Build-once-and-promote
+#     - Dev workflow builds and pushes image to ECR
+#     - Prod workflow pulls the SAME image from dev ECR (no rebuild)
+#     - Prod ECR policy needs: pull-only
+#
+#   nextjs-webapp: Build-per-environment
+#     - Each environment builds its own image (different build args/env vars)
+#     - Both dev and prod push to the SAME ECR registry
+#     - Prod ECR policy needs: push+pull
+#
+
+ECR_POLICY_DOCS
 fi
 
 # Knex migration (simple case - just development environment)

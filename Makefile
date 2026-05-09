@@ -1,4 +1,4 @@
-.PHONY: help setup bootstrap validate generate-workflows generate-docker generate-all clean
+.PHONY: help setup bootstrap validate generate-workflows generate-docker generate-all generate-doppler-webhooks clean
 
 # Load project configuration
 # If PROJECT is specified, use it. Otherwise, find the first project in outputs/
@@ -30,6 +30,7 @@ help: ## Show this help message
 	@echo "  make generate-docker           - Generate Dockerfile and build script only"
 	@echo "  make generate-release-script   - Generate release-prod.mjs script"
 	@echo "  make generate-secrets-snippets - Generate gh CLI snippets for secrets/variables"
+	@echo "  make generate-doppler-webhooks - Generate Doppler webhook setup script"
 	@echo ""
 	@echo "$(GREEN)Utilities:$(NC)"
 	@echo "  make check-docker-ready        - Validate if project is Docker-ready"
@@ -90,6 +91,11 @@ generate-secrets-snippets: validate ## Generate gh CLI snippets
 	@echo "$(BLUE)Generating GitHub secrets/variables snippets...$(NC)"
 	@PROJECT=$(PROJECT) ./scripts/generate-secrets-snippets.sh
 	@echo "$(GREEN)✓ Snippets generated$(NC)"
+
+generate-doppler-webhooks: validate ## Generate Doppler webhook setup script
+	@echo "$(BLUE)Generating Doppler webhook commands...$(NC)"
+	@PROJECT=$(PROJECT) ./scripts/generate-doppler-webhooks.sh
+	@echo "$(GREEN)✓ Doppler webhook script generated$(NC)"
 
 # ====================================================================
 # Utilities

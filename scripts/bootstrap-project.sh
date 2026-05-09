@@ -208,6 +208,7 @@ gather_project_config() {
     print_info "AWS Configuration (for ECR and ECS deployment)"
     prompt_input "AWS Region" "us-east-1" AWS_REGION
     prompt_input "ECR Repository name" "${PROJECT_NAME}" ECR_REPOSITORY
+    prompt_input "AWS Account ID (where ECR repos live)" "" ECR_ACCOUNT_ID
 
     # GitHub Configuration
     echo ""
@@ -419,6 +420,7 @@ project:
   aws:
     region: ${AWS_REGION}
     ecr_repository: ${ECR_REPOSITORY}
+    ecr_account_id: "${ECR_ACCOUNT_ID}"
 
   github:
     org: ${GITHUB_ORG}

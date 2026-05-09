@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 # Shared constants across all environments
 env:
@@ -107,6 +108,8 @@ jobs:
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: ${{ '{{' }} vars.AWS_ACCOUNT_ID_DEVELOPMENT {{ '}}' }}
 {% if MIGRATIONS_ENABLED %}
       - name: Read migrations image version
         id: migrations
@@ -125,11 +128,13 @@ jobs:
       - name: Verify API image exists in ECR
         env:
           ECR_REGISTRY: ${{ '{{' }} steps.login-ecr.outputs.registry {{ '}}' }}
+          ECR_REGISTRY_ID: ${{ '{{' }} vars.AWS_ACCOUNT_ID_DEVELOPMENT {{ '}}' }}
           IMAGE_TAG: ${{ '{{' }} steps.resolve.outputs.image_tag {{ '}}' }}
         run: |
           echo "Verifying API image exists: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
           if aws ecr describe-images \
+            --registry-id $ECR_REGISTRY_ID \
             --repository-name $ECR_REPOSITORY \
             --image-ids imageTag=$IMAGE_TAG \
             --region $AWS_REGION > /dev/null 2>&1; then
@@ -137,12 +142,14 @@ jobs:
 
             # Get image details
             IMAGE_DIGEST=$(aws ecr describe-images \
+              --registry-id $ECR_REGISTRY_ID \
               --repository-name $ECR_REPOSITORY \
               --image-ids imageTag=$IMAGE_TAG \
               --query 'imageDetails[0].imageDigest' \
               --output text)
 
             IMAGE_PUSHED=$(aws ecr describe-images \
+              --registry-id $ECR_REGISTRY_ID \
               --repository-name $ECR_REPOSITORY \
               --image-ids imageTag=$IMAGE_TAG \
               --query 'imageDetails[0].imagePushedAt' \
@@ -175,6 +182,7 @@ jobs:
 {% if MIGRATIONS_ENABLED %}
       - name: Verify migrations image exists in ECR
         env:
+          ECR_REGISTRY_ID: ${{ '{{' }} vars.AWS_ACCOUNT_ID_DEVELOPMENT {{ '}}' }}
           MIGRATIONS_IMAGE: ${{ '{{' }} steps.migrations.outputs.migrations_image {{ '}}' }}
         run: |
           echo "Verifying migrations image exists: $MIGRATIONS_IMAGE"
@@ -189,6 +197,7 @@ jobs:
           echo "Tag: $MIGRATIONS_TAG"
 
           if aws ecr describe-images \
+            --registry-id $ECR_REGISTRY_ID \
             --repository-name "$MIGRATIONS_REPO" \
             --image-ids imageTag="$MIGRATIONS_TAG" \
             --region $AWS_REGION > /dev/null 2>&1; then
@@ -196,12 +205,14 @@ jobs:
 
             # Get image details
             MIGRATIONS_DIGEST=$(aws ecr describe-images \
+              --registry-id $ECR_REGISTRY_ID \
               --repository-name "$MIGRATIONS_REPO" \
               --image-ids imageTag="$MIGRATIONS_TAG" \
               --query 'imageDetails[0].imageDigest' \
               --output text)
 
             MIGRATIONS_PUSHED=$(aws ecr describe-images \
+              --registry-id $ECR_REGISTRY_ID \
               --repository-name "$MIGRATIONS_REPO" \
               --image-ids imageTag="$MIGRATIONS_TAG" \
               --query 'imageDetails[0].imagePushedAt' \

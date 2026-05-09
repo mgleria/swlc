@@ -1,0 +1,210 @@
+name: Deploy to Production (ECS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Shared constants for readability
+env:
+  AWS_REGION: {{ AWS_REGION }}
+  ECR_REPOSITORY: {{ ECR_REPOSITORY }}
+  CONTAINER_NAME: {{ CONTAINER_NAME }}
+  # Prod-specific ECS resources (can be overridden by GitHub Environment vars if needed)
+  ECS_SERVICE: {{ ECS_SERVICE }}
+  ECS_CLUSTER: {{ ECS_CLUSTER }}
+  ECS_TASK_DEFINITION: {{ ECS_TASK_DEFINITION }}
+
+# Prevent concurrent prod deployments
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    # SOURCE OF TRUTH: GitHub Environment "production" for env-specific secrets/variables
+    environment: production
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for validation
+
+    # Validation guard: ensure tag is reachable from main
+    - name: Validate tag is from main branch
+      run: |
+        git fetch origin {{ MAIN_BRANCH }}
+        TAG_SHA=$(git rev-parse HEAD)
+
+        if ! git merge-base --is-ancestor $TAG_SHA origin/{{ MAIN_BRANCH }}; then
+          echo "❌ ERROR: Tag {% raw %}${{ github.ref_name }}{% endraw %} (commit $TAG_SHA) is not reachable from {{ MAIN_BRANCH }} branch"
+          echo "Production releases must be created from commits on the {{ MAIN_BRANCH }} branch"
+          exit 1
+        fi
+
+        echo "✅ Tag {% raw %}${{ github.ref_name }}{% endraw %} is valid and reachable from {{ MAIN_BRANCH }}"
+
+    - name: Compute image tags
+      id: tags
+      run: |
+        TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+        SHORT_SHA=$(git rev-parse --short=7 HEAD)
+        FULL_SHA=$(git rev-parse HEAD)
+        GIT_TAG={% raw %}${{ github.ref_name }}{% endraw %}
+
+        # Production image tags (immutable only, no latest)
+        TAG_TIMESTAMP="prod-${TIMESTAMP}-${SHORT_SHA}"
+        TAG_SHA="sha-${FULL_SHA}-prod"
+        TAG_RELEASE="${GIT_TAG}"
+
+        echo "timestamp=${TAG_TIMESTAMP}" >> $GITHUB_OUTPUT
+        echo "sha=${TAG_SHA}" >> $GITHUB_OUTPUT
+        echo "release=${TAG_RELEASE}" >> $GITHUB_OUTPUT
+        echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "full_sha=${FULL_SHA}" >> $GITHUB_OUTPUT
+        echo "git_tag=${GIT_TAG}" >> $GITHUB_OUTPUT
+
+    - name: Verify tag matches package.json version
+      env:
+        GIT_TAG: {% raw %}${{ steps.tags.outputs.git_tag }}{% endraw %}
+      run: |
+        echo "Verifying tag matches package.json version..."
+
+        # Extract version from tag (remove 'v' prefix)
+        TAG_VERSION="${GIT_TAG#v}"
+
+        # Read version from package.json
+        PACKAGE_VERSION=$(node -p "require('./package.json').version")
+
+        echo "Tag version: $TAG_VERSION"
+        echo "Package version: $PACKAGE_VERSION"
+
+        if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+          echo "❌ Error: Tag version does not match package.json version"
+          echo ""
+          echo "Tag:         v$TAG_VERSION"
+          echo "package.json: $PACKAGE_VERSION"
+          echo ""
+          echo "This usually means the tag was created manually without updating package.json."
+          echo "Use 'npm run release:prod' to ensure consistency."
+          exit 1
+        fi
+
+        echo "✅ Tag version matches package.json"
+
+    # SOURCE OF TRUTH: GitHub Environment Secret "production.AWS_ROLE_TO_ASSUME"
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: {% raw %}${{ secrets.AWS_ROLE_TO_ASSUME }}{% endraw %}
+        aws-region: {% raw %}${{ env.AWS_REGION }}{% endraw %}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      with:
+        registries: {% raw %}${{ vars.AWS_ACCOUNT_ID_DEVELOPMENT }}{% endraw %}
+
+    # Build — Doppler injects all env vars inside the Docker build via the service token.
+    # To add or change a variable, update the Doppler config; no workflow changes needed.
+    # DOPPLER_TOKEN is a GitHub Environment Secret scoped to "production".
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: {% raw %}${{ vars.AWS_ACCOUNT_ID_DEVELOPMENT }}{% endraw %}.dkr.ecr.{% raw %}${{ env.AWS_REGION }}{% endraw %}.amazonaws.com
+        TAG_TIMESTAMP: {% raw %}${{ steps.tags.outputs.timestamp }}{% endraw %}
+        TAG_SHA: {% raw %}${{ steps.tags.outputs.sha }}{% endraw %}
+        TAG_RELEASE: {% raw %}${{ steps.tags.outputs.release }}{% endraw %}
+        DOPPLER_TOKEN: {% raw %}${{ secrets.DOPPLER_TOKEN }}{% endraw %}
+      run: |
+        docker build \
+          --secret id=doppler_token,env=DOPPLER_TOKEN \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_TIMESTAMP \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_SHA \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_RELEASE \
+          .
+
+        # Push all three immutable tags
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_TIMESTAMP
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_SHA
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$TAG_RELEASE
+
+        # Output the primary image reference for deployment
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG_RELEASE" >> $GITHUB_OUTPUT
+        echo "image_timestamp=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG_TIMESTAMP" >> $GITHUB_OUTPUT
+        echo "image_sha=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG_SHA" >> $GITHUB_OUTPUT
+        echo "image_release=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG_RELEASE" >> $GITHUB_OUTPUT
+
+    # Download task definition from running ECS infrastructure (not from repo)
+    - name: Download task definition
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition {% raw %}${{ env.ECS_TASK_DEFINITION }}{% endraw %} \
+          --query taskDefinition > task-definition.json
+
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: {% raw %}${{ env.CONTAINER_NAME }}{% endraw %}
+        image: {% raw %}${{ steps.build-image.outputs.image }}{% endraw %}
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: {% raw %}${{ steps.task-def.outputs.task-definition }}{% endraw %}
+        service: {% raw %}${{ env.ECS_SERVICE }}{% endraw %}
+        cluster: {% raw %}${{ env.ECS_CLUSTER }}{% endraw %}
+        wait-for-service-stability: true
+
+    - name: Job Summary
+      if: always()
+      run: |
+        # Determine status emoji and message
+        if [ "{% raw %}${{ job.status }}{% endraw %}" == "success" ]; then
+          STATUS_EMOJI="✅"
+          STATUS_MSG="**Status:** Deployment successful"
+        elif [ "{% raw %}${{ job.status }}{% endraw %}" == "failure" ]; then
+          STATUS_EMOJI="❌"
+          STATUS_MSG="**Status:** Deployment failed"
+        else
+          STATUS_EMOJI="⚠️"
+          STATUS_MSG="**Status:** Deployment {% raw %}${{ job.status }}{% endraw %}"
+        fi
+
+        cat >> $GITHUB_STEP_SUMMARY <<EOF
+        ## ${STATUS_EMOJI} Production Deployment Summary
+
+        ${STATUS_MSG}
+
+        ### 📦 Release Information
+        - **Release Tag:** \`{% raw %}${{ steps.tags.outputs.git_tag }}{% endraw %}\`
+        - **Commit:** \`{% raw %}${{ steps.tags.outputs.short_sha }}{% endraw %}\` (\`{% raw %}${{ steps.tags.outputs.full_sha }}{% endraw %}\`)
+        - **Triggered by:** {% raw %}${{ github.actor }}{% endraw %}
+        - **Environment:** Production
+
+        ### 🏷️ Image Tags
+        - \`{% raw %}${{ steps.tags.outputs.release }}{% endraw %}\` (release tag)
+        - \`{% raw %}${{ steps.tags.outputs.timestamp }}{% endraw %}\` (timestamp + sha)
+        - \`{% raw %}${{ steps.tags.outputs.sha }}{% endraw %}\` (full sha)
+
+        ### 🎯 ECS Deployment
+        - **Cluster:** {% raw %}${{ env.ECS_CLUSTER }}{% endraw %}
+        - **Service:** {% raw %}${{ env.ECS_SERVICE }}{% endraw %}
+        - **Region:** {% raw %}${{ env.AWS_REGION }}{% endraw %}
+        - **Image:** \`{% raw %}${{ steps.build-image.outputs.image }}{% endraw %}\`
+
+        ### 🔗 Links
+        - [Release Tag]({% raw %}${{ github.server_url }}{% endraw %}/{% raw %}${{ github.repository }}{% endraw %}/releases/tag/{% raw %}${{ steps.tags.outputs.git_tag }}{% endraw %})
+        - [Commit]({% raw %}${{ github.server_url }}{% endraw %}/{% raw %}${{ github.repository }}{% endraw %}/commit/{% raw %}${{ steps.tags.outputs.full_sha }}{% endraw %})
+        - [Workflow Run]({% raw %}${{ github.server_url }}{% endraw %}/{% raw %}${{ github.repository }}{% endraw %}/actions/runs/{% raw %}${{ github.run_id }}{% endraw %})
+        EOF

@@ -1,0 +1,54 @@
+# Deployment Guide
+
+## Deploy to Development
+
+Merge your branch to `{{ MAIN_BRANCH }}`. That's it — GitHub Actions builds and deploys automatically.
+
+```
+feature branch → PR → merge to {{ MAIN_BRANCH }} → auto-deploy to dev
+```
+
+## Deploy to Production
+
+From `{{ MAIN_BRANCH }}`, run:
+
+```bash
+npm run release:prod
+```
+
+The script will:
+1. Validate you're on `{{ MAIN_BRANCH }}`, synced with origin, clean working tree
+2. Read the version from `package.json`
+3. Create a git tag `vX.Y.Z` and push it
+4. GitHub Actions picks up the tag and deploys to production
+
+To bump the version first, update `package.json` manually (or `npm version patch/minor/major`), commit, push, then run `release:prod`.
+
+### Options
+
+```bash
+npm run release:prod -- --dry-run   # Validate everything without actually releasing
+npm run release:prod -- --yes       # Skip confirmation prompt
+```
+
+## Secrets & Environment Variables
+
+Doppler is the source of truth for all secrets and environment variables.
+
+```
+Doppler → webhook → GitHub Actions (syncDopplerToS3) → S3 .env file → ECS container
+```
+
+**Updating a secret:** Change it in the Doppler web UI. A webhook automatically triggers the `syncDopplerToS3` GitHub Actions workflow, which syncs the updated `.env` to S3. ECS containers pick up the new values on their next task launch (i.e., next deployment or service restart).
+
+**If the webhook is not configured yet**, you can trigger the sync manually:
+- Run the `syncDopplerToS3` workflow from the GitHub Actions UI (workflow_dispatch), or
+- From the infra repo: `make sync-env-to-s3 ENV=<environment>`
+
+> Webhook automation for new projects is pending. Until then, configure Doppler webhooks manually to trigger the `syncDopplerToS3` workflow on secret changes.
+
+## Rollback
+
+**Dev:** Revert the commit on `{{ MAIN_BRANCH }}` and push. A new deployment triggers automatically.
+
+**Prod:** Revert the commit, push to `{{ MAIN_BRANCH }}`, bump version, then `npm run release:prod`.
